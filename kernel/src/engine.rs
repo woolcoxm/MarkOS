@@ -1,0 +1,627 @@
+//! Phase 8a: Qwen3 inference core — BPE tokenizer, q8_0 streaming matvec,
+//! RMSNorm, RoPE, GQA attention, SwiGLU FFN.
+//!
+//! Everything reads weights straight from the FAT volume at the tensor
+//! offsets gguf:: reported (read_at) — the 640 MB model never sits in RAM.
+//! Compute is correctness-first scalar f32; NEON tiling lands in the perf
+//! phase.
+//!
+//! owns: the scratch buffers below (BSP-only, selftest/serve context —
+//! the pool cores are parked during a forward pass in this phase).
+//! invariants: no panics on model data — malformed input yields Err.
+
+use core::intrinsics::{roundf32, roundf64, sqrtf32, sqrtf64};
+
+use crate::fat::{FatVolume, File};
+
+// Soundness: the intrinsics below are the hardware round/sqrt operations —
+// pure math, no memory effects; core does not expose them on this target.
+fn fround32(x: f32) -> f32 {
+    unsafe { roundf32(x) }
+}
+fn fround64(x: f64) -> f64 {
+    unsafe { roundf64(x) }
+}
+pub fn fsqrt32(x: f32) -> f32 {
+    unsafe { sqrtf32(x) }
+}
+fn fsqrt64(x: f64) -> f64 {
+    unsafe { sqrtf64(x) }
+}
+use crate::gguf;
+
+// ===== math helpers =====
+
+/// f16 (IEEE half) -> f32, exact.
+pub fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let man = (h & 0x3FF) as u32;
+    if exp == 0 {
+        if man == 0 {
+            return f32::from_bits(sign << 31);
+        }
+        let v = (man as f32) * 5.960_464_5e-8; // 2^-24
+        return if sign == 1 { -v } else { v };
+    }
+    let bits = if exp == 31 {
+        (sign << 31) | 0x7F80_0000 | (man << 13)
+    } else {
+        (sign << 31) | ((exp + 112) << 23) | (man << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// expf for moderate arguments (|x| < 80): 2^k * exp(r) with a degree-6
+/// Taylor on |r| <= ln2/2 — ~1 ulp against the host's math.exp in f32.
+fn expf(x: f32) -> f32 {
+    const LN2: f32 = 0.693_147_2;
+    const INV_LN2: f32 = 1.442_695;
+    let k = fround32(x * INV_LN2);
+    let r = x - k * LN2;
+    let r2 = r * r;
+    let e = 1.0
+        + r
+        + r2 * 0.5
+        + r2 * r * (1.0 / 6.0)
+        + r2 * r2 * (1.0 / 24.0)
+        + r2 * r2 * r * (1.0 / 120.0)
+        + r2 * r2 * r2 * (1.0 / 720.0);
+    let ki = k as i32;
+    let scale = f32::from_bits(((ki + 127) as u32) << 23);
+    scale * e
+}
+
+/// cos/sin for moderate f64 angles (|x| < 16): quadrant reduction by pi/2
+/// + Taylor. Used for RoPE at small positions.
+fn sincos(x: f64) -> (f64, f64) {
+    const FRAC_PI_2: f64 = 1.5707963267948966;
+    let k = fround64(x / FRAC_PI_2) as i64;
+    let r = x - k as f64 * FRAC_PI_2;
+    let r2 = r * r;
+    // cos(r) = 1 - r2/2! + r2^2/4! - r2^3/6! + r2^4/8!
+    let c = 1.0 + r2 * (-0.5 + r2 * (1.0 / 24.0 + r2 * (-1.0 / 720.0 + r2 / 40320.0)));
+    // sin(r) = r - r^3/3! + r^5/5! - r^7/7!
+    let r3 = r2 * r;
+    let s = r + r3 * (-1.0 / 6.0 + r2 * (1.0 / 120.0 + r2 * (-1.0 / 5040.0)));
+    match k & 3 {
+        0 => (c, s),
+        1 => (-s, c),
+        2 => (-c, -s),
+        _ => (s, -c),
+    }
+}
+
+// ===== geometry =====
+
+pub struct Geometry {
+    pub n_layers: u32,
+    pub n_embd: usize,
+    pub n_heads: usize,
+    pub n_kv: usize,
+    pub head_dim: usize,
+    pub n_ff: usize,
+    pub theta: f64,
+    pub eps: f32,
+}
+
+pub fn geometry() -> Result<Geometry, &'static str> {
+    let g = |name: &[u8]| {
+        gguf::kv_u32(name).ok_or("gguf: missing geometry kv")
+    };
+    Ok(Geometry {
+        n_layers: g(b"qwen3.block_count")?,
+        n_embd: g(b"qwen3.embedding_length")? as usize,
+        n_heads: g(b"qwen3.attention.head_count")? as usize,
+        n_kv: g(b"qwen3.attention.head_count_kv")? as usize,
+        head_dim: g(b"qwen3.attention.key_length")? as usize,
+        n_ff: g(b"qwen3.feed_forward_length")? as usize,
+        theta: gguf::kv_f32(b"qwen3.rope.freq_base").unwrap_or(1_000_000.0) as f64,
+        eps: gguf::kv_f32(b"qwen3.attention.layer_norm_rms_epsilon").unwrap_or(1e-6),
+    })
+}
+
+// ===== scratch (BSP-only; pool cores are parked during forward passes) =====
+
+const W_CHUNK_LEN: usize = 256 * 1024;
+static mut W_CHUNK: [u8; W_CHUNK_LEN] = [0; W_CHUNK_LEN];
+
+/// Per-token activations, sized for Qwen3-class small models.
+const MAX_DIM: usize = 3072;
+pub struct Activations {
+    pub x: [f32; MAX_DIM],   // embedding / residual stream (n_embd)
+    pub n1: [f32; MAX_DIM],  // normed input
+    pub q: [f32; MAX_DIM],   // n_heads * head_dim
+    pub k: [f32; MAX_DIM],   // n_kv * head_dim
+    pub v: [f32; MAX_DIM],
+    pub attn: [f32; MAX_DIM],
+    pub mid: [f32; MAX_DIM],
+    pub gate: [f32; MAX_DIM],
+    pub up: [f32; MAX_DIM],
+    pub hid: [f32; MAX_DIM],
+    /// KV cache: positions 0..N x n_kv x head_dim.
+    pub kc: [[f32; MAX_DIM]; 8],
+    pub vc: [[f32; MAX_DIM]; 8],
+    pub n_pos: usize,
+}
+
+/// ~310 KB — lives in .bss, never on a stack.
+static mut ACT: Activations = Activations {
+    x: [0.0; MAX_DIM],
+    n1: [0.0; MAX_DIM],
+    q: [0.0; MAX_DIM],
+    k: [0.0; MAX_DIM],
+    v: [0.0; MAX_DIM],
+    attn: [0.0; MAX_DIM],
+    mid: [0.0; MAX_DIM],
+    gate: [0.0; MAX_DIM],
+    up: [0.0; MAX_DIM],
+    hid: [0.0; MAX_DIM],
+    kc: [[0.0; MAX_DIM]; 8],
+    vc: [[0.0; MAX_DIM]; 8],
+    n_pos: 0,
+};
+
+/// Exclusive engine scratch.
+/// Soundness: BSP-only — the pool cores are parked during a forward pass,
+/// and the serve loop is single-threaded by design.
+pub fn activations_mut() -> &'static mut Activations {
+    unsafe { &mut *(&raw mut ACT) }
+}
+
+// ===== streaming matvec =====
+
+/// Dequantize one q8_0 row (embedding row, n elements) into `out`.
+pub fn dequant_q8_0_row(
+    vol: &FatVolume,
+    file: &File,
+    abs: u64,
+    n: usize,
+    out: &mut [f32],
+) -> Result<(), &'static str> {
+    let row_bytes = n / 32 * 34;
+    if row_bytes > W_CHUNK_LEN {
+        return Err("dequant: row too large");
+    }
+    // Soundness: W_CHUNK is engine scratch on the BSP; the device DMAs
+    // into it while the forward pass is the only runner.
+    let chunk = unsafe {
+        core::slice::from_raw_parts_mut((&raw mut W_CHUNK) as *mut u8, W_CHUNK_LEN)
+    };
+    vol.read_at(file, abs, &mut chunk[..row_bytes])?;
+    for b in 0..n / 32 {
+        let s = f16_to_f32(u16::from_le_bytes([chunk[b * 34], chunk[b * 34 + 1]]));
+        for j in 0..32 {
+            out[b * 32 + j] = s * ((chunk[b * 34 + 2 + j] as i8) as f32);
+        }
+    }
+    Ok(())
+}
+
+/// Read an F32 vector (norm weights) from the volume.
+pub fn read_f32_vec(
+    vol: &FatVolume,
+    file: &File,
+    abs: u64,
+    n: usize,
+    out: &mut [f32],
+) -> Result<(), &'static str> {
+    let row_bytes = n * 4;
+    if row_bytes > W_CHUNK_LEN {
+        return Err("f32vec: too large");
+    }
+    let chunk = unsafe {
+        core::slice::from_raw_parts_mut((&raw mut W_CHUNK) as *mut u8, W_CHUNK_LEN)
+    };
+    vol.read_at(file, abs, &mut chunk[..row_bytes])?;
+    for i in 0..n {
+        out[i] = f32::from_le_bytes([
+            chunk[i * 4],
+            chunk[i * 4 + 1],
+            chunk[i * 4 + 2],
+            chunk[i * 4 + 3],
+        ]);
+    }
+    Ok(())
+}
+
+/// y[n_out] = W @ x, W q8_0 [n_out rows x n_in] read from the volume in
+/// row chunks. GGUF q8_0 block: f16 scale + 32 int8 quants (34 B).
+pub fn matvec_q8_0(
+    vol: &FatVolume,
+    file: &File,
+    abs: u64,
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    y: &mut [f32],
+) -> Result<(), &'static str> {
+    let row_bytes = n_in / 32 * 34;
+    if row_bytes == 0 || row_bytes > W_CHUNK_LEN {
+        return Err("matvec: row too large");
+    }
+    let chunk_rows = W_CHUNK_LEN / row_bytes;
+    // Soundness: W_CHUNK is engine scratch on the BSP; the device DMAs
+    // into it while the forward pass is the only runner.
+    let chunk = unsafe {
+        core::slice::from_raw_parts_mut((&raw mut W_CHUNK) as *mut u8, W_CHUNK_LEN)
+    };
+    let n_blk = n_in / 32;
+    let mut done = 0usize;
+    while done < n_out {
+        let rows = chunk_rows.min(n_out - done);
+        vol.read_at(
+            file,
+            abs + (done as u64) * row_bytes as u64,
+            &mut chunk[..rows * row_bytes],
+        )?;
+        for r in 0..rows {
+            let rb = &chunk[r * row_bytes..(r + 1) * row_bytes];
+            let mut acc = 0f32;
+            for b in 0..n_blk {
+                let blk = &rb[b * 34..b * 34 + 34];
+                let s = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                for j in 0..32 {
+                    acc += x[b * 32 + j] * s * ((blk[2 + j] as i8) as f32);
+                }
+            }
+            y[done + r] = acc;
+        }
+        done += rows;
+    }
+    Ok(())
+}
+
+/// RMSNorm: x/sqrt(mean(x^2)+eps) * w, w F32 read from the volume.
+pub fn rmsnorm_with_weight(
+    vol: &FatVolume,
+    file: &File,
+    w_abs: u64,
+    x: &[f32],
+    out: &mut [f32],
+    eps: f32,
+) -> Result<(), &'static str> {
+    let n = x.len();
+    // Soundness: scratch as above.
+    let chunk = unsafe {
+        core::slice::from_raw_parts_mut((&raw mut W_CHUNK) as *mut u8, W_CHUNK_LEN)
+    };
+    if n * 4 > W_CHUNK_LEN {
+        return Err("rmsnorm: weight too large");
+    }
+    vol.read_at(file, w_abs, &mut chunk[..n * 4])?;
+    let mut sum = 0f32;
+    for i in 0..n {
+        sum += x[i] * x[i];
+    }
+    let inv = 1.0 / fsqrt32(sum / n as f32 + eps);
+    for i in 0..n {
+        let w = f32::from_le_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
+        out[i] = x[i] * inv * w;
+    }
+    Ok(())
+}
+
+/// In-place per-head RMSNorm (Qwen3 q_norm/k_norm), then RoPE.
+pub fn head_norm_rope(
+    h: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    w: &[f32],
+    eps: f32,
+    pos: usize,
+    theta: f64,
+) {
+    let half = head_dim / 2;
+    // theta^(-i/half) recurrence: inv_step = theta^(-1/half) — `half` is a
+    // power of two, so the root is `log2(half)` square roots.
+    let inv_step = theta_inv_step(theta, half as f64);
+    for head in 0..n_heads {
+        let base = head * head_dim;
+        let hslice = &mut h[base..base + head_dim];
+        let mut sum = 0f32;
+        for v in hslice.iter() {
+            sum += v * v;
+        }
+        let inv = 1.0 / fsqrt32(sum / head_dim as f32 + eps);
+        for (i, v) in hslice.iter_mut().enumerate() {
+            *v *= inv * w[i];
+        }
+        let mut freq = 1.0f64;
+        for i in 0..half {
+            let ang = (pos as f64) * freq;
+            let (c, s) = sincos(ang);
+            let x1 = hslice[i] as f64;
+            let x2 = hslice[i + half] as f64;
+            hslice[i] = (x1 * c - x2 * s) as f32;
+            hslice[i + half] = (x2 * c + x1 * s) as f32;
+            freq *= inv_step;
+        }
+    }
+}
+
+/// theta^(-1/n): n must be a power of two; log2(n) square roots.
+fn theta_inv_step(theta: f64, n: f64) -> f64 {
+    let mut v = theta;
+    let mut k = n;
+    while k > 1.0 {
+        v = fsqrt64(v);
+        k *= 0.5;
+    }
+    1.0 / v
+}
+
+/// Dot + softmax attention for one token over the cached positions.
+pub fn attend(
+    act: &mut Activations,
+    t: usize,
+    geo: &Geometry,
+    probs_first_head: &mut [f32],
+) {
+    let hd = geo.head_dim;
+    let q_per_kv = geo.n_heads / geo.n_kv;
+    let scale = 1.0 / fsqrt32(hd as f32);
+    for h in 0..geo.n_heads {
+        let kvh = h / q_per_kv;
+        // scores over positions 0..=t
+        let mut max = f32::MIN;
+        let mut scores = [0f32; 8];
+        for p in 0..=t {
+            let mut dot = 0f32;
+            for i in 0..hd {
+                dot += act.q[h * hd + i] * act.kc[p][kvh * hd + i];
+            }
+            let s = dot * scale;
+            scores[p] = s;
+            if s > max {
+                max = s;
+            }
+        }
+        let mut sum = 0f32;
+        for p in 0..=t {
+            scores[p] = expf(scores[p] - max);
+            sum += scores[p];
+        }
+        let inv = 1.0 / sum;
+        if h == 0 {
+            for p in 0..=t {
+                probs_first_head[p] = scores[p] * inv;
+            }
+        }
+        for i in 0..hd {
+            let mut acc = 0f32;
+            for p in 0..=t {
+                acc += scores[p] * inv * act.vc[p][kvh * hd + i];
+            }
+            act.attn[h * hd + i] = acc;
+        }
+    }
+}
+
+/// SiLU in place: v * sigmoid(v).
+pub fn silu(v: &mut [f32]) {
+    for e in v.iter_mut() {
+        let s = expf(-*e);
+        *e = *e / (1.0 + s);
+    }
+}
+
+// ===== tokenizer: Qwen3 byte-level BPE from the GGUF vocab =====
+//
+// The vocab/merges string arrays live inside the metadata buffer; queries
+// walk them sequentially (the prompt is tiny, so a handful of linear
+// passes over ~150k strings is cheap next to the matmuls).
+
+pub const MAX_TOKENS: usize = 16;
+const MAX_SYMS: usize = 64;
+const MAX_SYM_BYTES: usize = 256;
+const MAX_PIECES: usize = 16;
+
+struct StrIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+    left: u32,
+}
+
+impl<'a> StrIter<'a> {
+    fn new(data: &'a [u8], off: usize, count: u32) -> Self {
+        Self { data, pos: off, left: count }
+    }
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.left == 0 {
+            return None;
+        }
+        let hdr = self.data.get(self.pos..self.pos + 8)?;
+        let len = u64::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7]])
+            as usize;
+        self.pos += 8;
+        let s = self.data.get(self.pos..self.pos + len)?;
+        self.pos += len;
+        self.left -= 1;
+        Some(s)
+    }
+}
+
+/// GPT-2 byte->unicode codepoint mapping (vocab strings are its UTF-8).
+fn byte_unicode_cp(b: u8) -> u32 {
+    let b = b as u32;
+    if (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b) {
+        b
+    } else if b < 33 {
+        256 + b
+    } else if (127..=160).contains(&b) {
+        256 + 33 + (b - 127)
+    } else {
+        256 + 67 // byte 173
+    }
+}
+
+/// Byte-unicode encode one prompt byte into `out` (1-2 bytes); returns len.
+fn byte_encode(b: u8, out: &mut [u8; 2]) -> usize {
+    let cp = byte_unicode_cp(b);
+    if cp < 0x80 {
+        out[0] = cp as u8;
+        1
+    } else {
+        out[0] = 0xC0 | (cp >> 6) as u8;
+        out[1] = 0x80 | (cp & 0x3F) as u8;
+        2
+    }
+}
+
+fn is_space(b: u8) -> bool {
+    b == b' ' || b == b'\n' || b == b'\t' || b == b'\r'
+}
+
+/// GPT-2-style pre-tokenization, ASCII subset: `' contractions` are not
+/// special-cased (they tokenize through the "other" class). Pieces are
+/// (start, len) ranges over the prompt.
+fn pretokenize(prompt: &[u8], pieces: &mut [(usize, usize)]) -> Result<usize, &'static str> {
+    let len = prompt.len();
+    let mut i = 0usize;
+    let mut n = 0usize;
+    while i < len {
+        let mut start = i;
+        if is_space(prompt[i]) {
+            let ws = i;
+            while i < len && is_space(prompt[i]) {
+                i += 1;
+            }
+            if i == len {
+                pieces[n] = (ws, i - ws);
+                n += 1;
+                break;
+            }
+            // Trailing run (minus its last space) is its own piece; the
+            // last space leads the next piece.
+            if i - ws > 1 {
+                pieces[n] = (ws, i - ws - 1);
+                n += 1;
+            }
+            start = i - 1;
+        }
+        let b = prompt[i];
+        if b.is_ascii_alphabetic() {
+            while i < len && prompt[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+        } else if b.is_ascii_digit() {
+            while i < len && prompt[i].is_ascii_digit() {
+                i += 1;
+            }
+        } else if !is_space(b) {
+            while i < len && !prompt[i].is_ascii_alphanumeric() && !is_space(prompt[i]) {
+                i += 1;
+            }
+        }
+        pieces[n] = (start, i - start);
+        n += 1;
+        if n >= MAX_PIECES {
+            return Err("tokenize: too many pieces");
+        }
+    }
+    Ok(n)
+}
+
+/// Tokenize `prompt` with the GGUF's BPE; returns the token count.
+pub fn tokenize(
+    data: &[u8],
+    prompt: &[u8],
+    ids: &mut [u32; MAX_TOKENS],
+) -> Result<usize, &'static str> {
+    let (voff, vcount) = gguf::string_array(b"tokenizer.ggml.tokens").ok_or("no vocab array")?;
+    let (moff, mcount) = gguf::string_array(b"tokenizer.ggml.merges").ok_or("no merges array")?;
+
+    let mut pieces = [(0usize, 0usize); MAX_PIECES];
+    let np = pretokenize(prompt, &mut pieces)?;
+
+    let mut sym = [0u8; MAX_SYM_BYTES];
+    let mut starts = [0usize; MAX_SYMS];
+    let mut lens = [0usize; MAX_SYMS];
+    let mut n_ids = 0usize;
+
+    for &(ps, pl) in &pieces[..np] {
+        // Byte-unicode encode the piece into individual symbols.
+        let mut sym_len = 0usize;
+        let mut ns = 0usize;
+        for &b in &prompt[ps..ps + pl] {
+            let mut e = [0u8; 2];
+            let n = byte_encode(b, &mut e);
+            if sym_len + n > MAX_SYM_BYTES || ns >= MAX_SYMS {
+                return Err("tokenize: piece too long");
+            }
+            sym[sym_len..sym_len + n].copy_from_slice(&e[..n]);
+            starts[ns] = sym_len;
+            lens[ns] = n;
+            sym_len += n;
+            ns += 1;
+        }
+
+        // Greedy lowest-rank merging: one pass over the merges array finds
+        // the best adjacent pair for this round.
+        loop {
+            if ns < 2 {
+                break;
+            }
+            let mut best_rank = u32::MAX;
+            let mut best_i = usize::MAX;
+            let mut it = StrIter::new(data, moff, mcount);
+            let mut rank = 0u32;
+            while let Some(m) = it.next() {
+                let mut i = 0usize;
+                while i + 1 < ns {
+                    let (sa, la) = (starts[i], lens[i]);
+                    let (sb, lb) = (starts[i + 1], lens[i + 1]);
+                    if m.len() == la + 1 + lb
+                        && &m[..la] == &sym[sa..sa + la]
+                        && m[la] == b' '
+                        && &m[la + 1..] == &sym[sb..sb + lb]
+                    {
+                        if rank < best_rank {
+                            best_rank = rank;
+                            best_i = i;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                rank += 1;
+            }
+            if best_i == usize::MAX {
+                break;
+            }
+            // Merge symbols best_i and best_i+1 (bytes are adjacent).
+            lens[best_i] += lens[best_i + 1];
+            for j in best_i + 1..ns - 1 {
+                starts[j] = starts[j + 1];
+                lens[j] = lens[j + 1];
+            }
+            ns -= 1;
+        }
+
+        // Final symbols -> ids by vocab lookup.
+        for s in 0..ns {
+            let a = starts[s];
+            let l = lens[s];
+            let mut it = StrIter::new(data, voff, vcount);
+            let mut found = None;
+            let mut id = 0u32;
+            while let Some(v) = it.next() {
+                if v.len() == l && v == &sym[a..a + l] {
+                    found = Some(id);
+                    break;
+                }
+                id += 1;
+            }
+            let Some(id) = found else {
+                return Err("tokenize: symbol not in vocab");
+            };
+            if n_ids >= MAX_TOKENS {
+                return Err("tokenize: too many tokens");
+            }
+            ids[n_ids] = id;
+            n_ids += 1;
+        }
+    }
+    Ok(n_ids)
+}

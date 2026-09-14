@@ -10,6 +10,7 @@
 //! smp::start_aps releases them; interrupts stay masked until the GIC phase.
 
 #![no_std]
+#![feature(core_intrinsics)]
 #![no_main]
 
 mod board;
@@ -18,6 +19,7 @@ mod cache;
 mod config;
 mod control;
 mod cpu;
+mod engine;
 mod fat;
 mod gguf;
 mod matmul;
@@ -195,6 +197,8 @@ extern "C" fn kmain() -> ! {
     selftest_net();
     #[cfg(feature = "selftest-model")]
     selftest_model();
+    #[cfg(feature = "selftest-forward")]
+    selftest_forward();
     #[cfg(feature = "selftest-pcie")]
     selftest_pcie();
 
@@ -738,7 +742,264 @@ fn selftest_model() -> ! {
     }
 
     uart::locked_write(format_args!("PASS: model load\n"));
-    park()
+    psci::system_off()
+}
+
+/// Phase 8a acceptance: forward pass through decoder layer 0 of the REAL
+/// Qwen3-0.6B GGUF — BPE tokenizer, embedding, RMSNorm, q8_0 matmuls,
+/// per-head q/k norm, RoPE, GQA attention, SwiGLU FFN — for a two-token
+/// prompt. Output lines are tolerance-compared against the numpy reference
+/// (scripts/forward_ref.py) by the test-forward gate.
+#[cfg(feature = "selftest-forward")]
+fn selftest_forward() -> ! {
+    const META_LEN: usize = 8 * 1024 * 1024;
+    static mut META_BUF: [u8; META_LEN] = [0u8; META_LEN];
+    const QW_LEN: usize = 128;
+    static mut QW: [f32; QW_LEN] = [0f32; QW_LEN];
+    static mut KW: [f32; QW_LEN] = [0f32; QW_LEN];
+    static mut PROBS: [f32; 8] = [0f32; 8];
+    const PROMPT: &[u8] = b"hello world";
+
+    uart::write_str("selftest: forward pass (layer 0)\n");
+    if let Err(e) = virtio_blk::init() {
+        uart::locked_write(format_args!("FAIL: virtio init: {e}\n"));
+        park()
+    }
+
+    let vol = match fat::mount() {
+        Ok(v) => v,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: fat mount: {e}\n"));
+            park()
+        }
+    };
+    let file = match vol.open_model() {
+        Ok(f) => f,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: open model: {e}\n"));
+            park()
+        }
+    };
+
+    let n = {
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut((&raw mut META_BUF) as *mut u8, META_LEN)
+        };
+        match vol.read_at(&file, 0, buf) {
+            Ok(n) => n,
+            Err(e) => {
+                uart::locked_write(format_args!("FAIL: metadata read: {e}\n"));
+                park()
+            }
+        }
+    };
+    let meta = unsafe {
+        core::slice::from_raw_parts((&raw const META_BUF) as *const u8, n)
+    };
+    let info = match gguf::parse_and_dump(meta) {
+        Ok(i) => i,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: gguf parse: {e}\n"));
+            park()
+        }
+    };
+    let geo = match engine::geometry() {
+        Ok(g) => g,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: geometry: {e}\n"));
+            park()
+        }
+    };
+    uart::locked_write(format_args!(
+        "geo: layers={} embd={} heads={} kv={} head_dim={} ffn={}\n",
+        geo.n_layers, geo.n_embd, geo.n_heads, geo.n_kv, geo.head_dim, geo.n_ff
+    ));
+
+    let mut ids = [0u32; engine::MAX_TOKENS];
+    let n_tok = match engine::tokenize(meta, PROMPT, &mut ids) {
+        Ok(n) => n,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: tokenize: {e}\n"));
+            park()
+        }
+    };
+    uart::locked_write(format_args!(
+        "TOKS prompt={} ids=",
+        core::str::from_utf8(PROMPT).unwrap_or("?")
+    ));
+    for (i, id) in ids.iter().take(n_tok).enumerate() {
+        if i > 0 {
+            uart::write_byte(b',');
+        }
+        uart::locked_write(format_args!("{id}"));
+    }
+    uart::locked_write(format_args!(" n_tokens={n_tok}\n"));
+
+    // Absolute tensor base = data section start + table offset.
+    let ds = info.data_start;
+    let base = |name: &[u8]| -> Option<(u64, [u64; 4], u32)> {
+        gguf::find_tensor(name).map(|(_, dims, ttype, off)| (ds + off, *dims, ttype))
+    };
+    let Some((emb_abs, emb_dims, _)) = base(b"token_embd.weight") else {
+        uart::write_str("FAIL: token_embd.weight\n");
+        park()
+    };
+    let row_elems = emb_dims[0] as usize;
+
+    let mut qw = [0f32; QW_LEN];
+    let mut kw = [0f32; QW_LEN];
+    let mut nw = [0f32; QW_LEN];
+    let hd = geo.head_dim;
+
+    let act = engine::activations_mut();
+    let mut probs = [0f32; 8];
+
+    macro_rules! need {
+        ($name:expr) => {
+            match base($name) {
+                Some(v) => v,
+                None => {
+                    uart::locked_write(format_args!("FAIL: tensor {}\n", core::str::from_utf8($name).unwrap_or("?")));
+                    park()
+                }
+            }
+        };
+    }
+
+    for t in 0..n_tok {
+        uart::write_str("dbg: t loop
+");
+        // Embedding row for this token.
+        let row = emb_abs + (ids[t] as u64) * (row_elems / 32 * 34) as u64;
+        if engine::dequant_q8_0_row(&vol, &file, row, row_elems, &mut act.x[..geo.n_embd]).is_err()
+        {
+            uart::write_str("FAIL: embed\n");
+            park()
+        }
+        uart::write_str("dbg: dequant ok
+");
+        let rms = engine::fsqrt32(
+            act.x[..geo.n_embd].iter().map(|v| v * v).sum::<f32>() / geo.n_embd as f32,
+        );
+        uart::locked_write(format_args!(
+            "EMB{t} id={} rms={rms:.6e} v={:.6e},{:.6e},{:.6e},{:.6e}\n",
+            ids[t], act.x[0], act.x[1], act.x[2], act.x[3]
+        ));
+
+        // Input RMSNorm.
+        let (an_abs, _, _) = need!(b"blk.0.attn_norm.weight");
+        let _ = engine::rmsnorm_with_weight(
+            &vol, &file, an_abs, &act.x[..geo.n_embd], &mut act.n1[..geo.n_embd], geo.eps,
+        );
+        uart::locked_write(format_args!(
+            "NRM{t} v={:.6e},{:.6e},{:.6e},{:.6e}\n",
+            act.n1[0], act.n1[1], act.n1[2], act.n1[3]
+        ));
+
+        // Q/K/V projections.
+        let (q_abs, q_dims, _) = need!(b"blk.0.attn_q.weight");
+        let (k_abs, k_dims, _) = need!(b"blk.0.attn_k.weight");
+        let (v_abs, v_dims, _) = need!(b"blk.0.attn_v.weight");
+        let _ = engine::matvec_q8_0(
+            &vol, &file, q_abs, q_dims[0] as usize, q_dims[1] as usize,
+            &act.n1[..geo.n_embd], &mut act.q,
+        );
+        let _ = engine::matvec_q8_0(
+            &vol, &file, k_abs, k_dims[0] as usize, k_dims[1] as usize,
+            &act.n1[..geo.n_embd], &mut act.k,
+        );
+        let _ = engine::matvec_q8_0(
+            &vol, &file, v_abs, v_dims[0] as usize, v_dims[1] as usize,
+            &act.n1[..geo.n_embd], &mut act.v,
+        );
+
+        // Per-head q/k norm + RoPE at position t.
+        let (qn_abs, _, _) = need!(b"blk.0.attn_q_norm.weight");
+        let (kn_abs, _, _) = need!(b"blk.0.attn_k_norm.weight");
+        let _ = engine::read_f32_vec(&vol, &file, qn_abs, hd, &mut qw[..hd]);
+        let _ = engine::read_f32_vec(&vol, &file, kn_abs, hd, &mut kw[..hd]);
+        engine::head_norm_rope(
+            &mut act.q[..geo.n_heads * hd], geo.n_heads, hd, &qw[..hd], geo.eps, t, geo.theta,
+        );
+        engine::head_norm_rope(
+            &mut act.k[..geo.n_kv * hd], geo.n_kv, hd, &kw[..hd], geo.eps, t, geo.theta,
+        );
+        uart::locked_write(format_args!(
+            "QK{t} q={:.6e},{:.6e},{:.6e},{:.6e} k={:.6e},{:.6e},{:.6e},{:.6e}\n",
+            act.q[0], act.q[1], act.q[2], act.q[3],
+            act.k[0], act.k[1], act.k[2], act.k[3]
+        ));
+
+        // Cache K/V for this position, then causal attention.
+        act.kc[t][..geo.n_kv * hd].copy_from_slice(&act.k[..geo.n_kv * hd]);
+        act.vc[t][..geo.n_kv * hd].copy_from_slice(&act.v[..geo.n_kv * hd]);
+        act.n_pos = t + 1;
+        engine::attend(act, t, &geo, &mut probs);
+        if t == 0 {
+            uart::locked_write(format_args!(
+                "ATT{t} p0={:.6e} o={:.6e},{:.6e},{:.6e},{:.6e}\n",
+                probs[0], act.attn[0], act.attn[1], act.attn[2], act.attn[3]
+            ));
+        } else {
+            uart::locked_write(format_args!(
+                "ATT{t} p0={:.6e} p1={:.6e} o={:.6e},{:.6e},{:.6e},{:.6e}\n",
+                probs[0], probs[1], act.attn[0], act.attn[1], act.attn[2], act.attn[3]
+            ));
+        }
+
+        // Output projection + residual.
+        let (o_abs, o_dims, _) = need!(b"blk.0.attn_output.weight");
+        let _ = engine::matvec_q8_0(
+            &vol, &file, o_abs, o_dims[0] as usize, o_dims[1] as usize,
+            &act.attn[..o_dims[0] as usize], &mut act.mid[..o_dims[1] as usize],
+        );
+        for i in 0..geo.n_embd {
+            act.mid[i] += act.x[i];
+        }
+        uart::locked_write(format_args!(
+            "MID{t} v={:.6e},{:.6e},{:.6e},{:.6e}\n",
+            act.mid[0], act.mid[1], act.mid[2], act.mid[3]
+        ));
+
+        // FFN: norm -> gate/up -> SiLU gate -> down -> residual.
+        let (fn_abs, _, _) = need!(b"blk.0.ffn_norm.weight");
+        let _ = engine::rmsnorm_with_weight(
+            &vol, &file, fn_abs, &act.mid[..geo.n_embd], &mut act.n1[..geo.n_embd], geo.eps,
+        );
+        let (g_abs, g_dims, _) = need!(b"blk.0.ffn_gate.weight");
+        let (u_abs, u_dims, _) = need!(b"blk.0.ffn_up.weight");
+        let (d_abs, d_dims, _) = need!(b"blk.0.ffn_down.weight");
+        let n_ff = g_dims[1] as usize;
+        let _ = engine::matvec_q8_0(
+            &vol, &file, g_abs, g_dims[0] as usize, n_ff,
+            &act.n1[..geo.n_embd], &mut act.gate[..n_ff],
+        );
+        let _ = engine::matvec_q8_0(
+            &vol, &file, u_abs, u_dims[0] as usize, u_dims[1] as usize,
+            &act.n1[..geo.n_embd], &mut act.up[..u_dims[1] as usize],
+        );
+        engine::silu(&mut act.gate[..n_ff]);
+        for i in 0..n_ff {
+            act.gate[i] *= act.up[i];
+        }
+        let _ = engine::matvec_q8_0(
+            &vol, &file, d_abs, d_dims[0] as usize, d_dims[1] as usize,
+            &act.gate[..d_dims[0] as usize], &mut act.hid[..d_dims[1] as usize],
+        );
+        for i in 0..d_dims[1] as usize {
+            act.hid[i] += act.mid[i];
+        }
+        let mut sum = 0f64;
+        for i in 0..d_dims[1] as usize {
+            sum += act.hid[i] as f64;
+        }
+        uart::locked_write(format_args!(
+            "HID{t} v={:.6e},{:.6e},{:.6e},{:.6e} sum={sum:.6e}\n",
+            act.hid[0], act.hid[1], act.hid[2], act.hid[3]
+        ));
+    }
+    uart::locked_write(format_args!("PASS: forward\n"));
+    psci::system_off()
 }
 
 /// Panic path: print and park. Interrupts are masked at EL1.

@@ -240,6 +240,19 @@ test-model: image-virt $(REAL_IMG)
 	tr -d "\r" < serial-model.log | grep -q "^PASS: model load" || { echo "FAIL: model load (no PASS marker)"; tail -5 serial-model.log; exit 1; }; \
 	diff $(HOME)/.markos-tests/expected.txt $(HOME)/.markos-tests/got.txt > $(HOME)/.markos-tests/model.diff && echo "PASS: model load" || { echo "FAIL: model load (expected vs got):"; head -10 $(HOME)/.markos-tests/model.diff; exit 1; }
 
+## Phase 8a acceptance: single-layer forward pass over the real GGUF —
+## in-kernel BPE tokenizer, embedding, RMSNorm, q8_0 matmuls, RoPE, GQA
+## attention, SwiGLU FFN — validated against the numpy reference
+## (scripts/forward_ref.py) with scripts/forward_check.py.
+test-forward: image-virt $(REAL_IMG)
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-forward
+	python3 scripts/forward_ref.py $(MODEL_FILE) $(HOME)/.markos-tests/fwd-expected.txt
+	bash scripts/kill_qemu.sh; sleep 1; \
+	timeout 300 $(QEMU) $(VIRTFLAGS) -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 > serial-fwd.log 2>&1 || true; \
+	tr -d "\r" < serial-fwd.log | grep -E "^(TOKS|EMB|NRM|QK|ATT|MID|HID|PASS: forward)" > $(HOME)/.markos-tests/fwd-got.txt || true; \
+	tr -d "\r" < serial-fwd.log | grep -q "^PASS: forward" || { echo "FAIL: forward (no PASS marker)"; tail -5 serial-fwd.log; exit 1; }; \
+	python3 scripts/forward_check.py $(HOME)/.markos-tests/fwd-expected.txt $(HOME)/.markos-tests/fwd-got.txt && echo "PASS: forward pass" || { echo "FAIL: forward pass"; exit 1; }
+
 ## Pi-2 acceptance (qemu-virt, PSCI): 4 cores online, exact shared counter.
 test-smp: image-virt
 	timeout --preserve-status $(TIMEOUT) $(QEMU) $(VIRTFLAGS) \

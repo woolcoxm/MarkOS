@@ -40,6 +40,13 @@ pub struct File {
     pub size: u32,
 }
 
+/// One-sector cache for FAT entry lookups: sequential cluster walks hit
+/// the same sector 128 times in a row (512B / 4B entries).
+/// Soundness: BSP-only volume state; mount/read happen on one core.
+static mut FAT_CACHE_LBA: u64 = u64::MAX;
+static mut FAT_CACHE: [u8; 512] = [0u8; 512];
+const FAT_CACHE_LEN: usize = 512;
+
 fn rd16(buf: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([buf[off], buf[off + 1]])
 }
@@ -105,12 +112,36 @@ impl FatVolume {
 
     /// FAT entry for `cluster` (FAT32: 32-bit LE, top 4 bits reserved).
     fn fat_entry(&self, cluster: u32) -> Result<u32, &'static str> {
-        let mut sector = [0u8; SECTOR];
         let fat_off_bytes = cluster as usize * 4;
         let lba = self.fat_start_lba + (fat_off_bytes / SECTOR) as u64;
-        virtio_blk::read_sectors(lba, 1, &mut sector)?;
         let off = fat_off_bytes % SECTOR;
-        Ok(rd32(&sector, off) & 0x0FFF_FFFF)
+        // One-sector cache: sequential cluster walks hit the same FAT
+        // sector up to 128 times in a row (512B / 4B entries). Without it,
+        // every read_at re-reads each FAT sector once per cluster skip.
+        // Soundness: BSP-only volume state; reads happen on one core.
+        let cached = unsafe {
+            let mut hit = false;
+            if FAT_CACHE_LBA == lba {
+                hit = true;
+            }
+            if !hit {
+                virtio_blk::read_sectors(
+                    lba,
+                    1,
+                    &mut *(core::slice::from_raw_parts_mut(
+                        (&raw mut FAT_CACHE) as *mut u8,
+                        FAT_CACHE_LEN,
+                    )),
+                )?;
+                FAT_CACHE_LBA = lba;
+            }
+            let bytes = core::slice::from_raw_parts(
+                (&raw const FAT_CACHE) as *const u8,
+                FAT_CACHE_LEN,
+            );
+            rd32(bytes, off) & 0x0FFF_FFFF
+        };
+        Ok(cached)
     }
 
     /// Read the whole cluster `cluster` into `buf`.

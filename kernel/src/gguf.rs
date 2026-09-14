@@ -179,6 +179,124 @@ pub fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+// ===== metadata capture: scalar kvs + string-array locations =====
+//
+// The inference engine needs scalar kv values (geometry: head counts,
+// eps, rope base) and the byte ranges of the tokenizer's string arrays
+// (vocab, merges) inside the caller's metadata buffer. Captured during
+// parse_and_dump; read-only afterwards.
+
+const MAX_KV: usize = 48;
+const MAX_KV_KEY: usize = 48;
+const MAX_STR_ARRAYS: usize = 4;
+const MAX_SA_KEY: usize = 32;
+
+#[derive(Clone, Copy)]
+struct KvScalar {
+    key: [u8; MAX_KV_KEY],
+    key_len: usize,
+    /// Raw 4 bytes; interpret via `is_float` (u32/i32 share `u`).
+    u: u32,
+    f: f32,
+    is_float: bool,
+}
+
+static mut KV_SCALARS: [KvScalar; MAX_KV] = [KvScalar {
+    key: [0; MAX_KV_KEY],
+    key_len: 0,
+    u: 0,
+    f: 0.0,
+    is_float: false,
+}; MAX_KV];
+static mut KV_N: usize = 0;
+
+static mut SA_KEYS: [[u8; MAX_SA_KEY]; MAX_STR_ARRAYS] = [[0; MAX_SA_KEY]; MAX_STR_ARRAYS];
+static mut SA_KEY_LEN: [usize; MAX_STR_ARRAYS] = [0; MAX_STR_ARRAYS];
+static mut SA_OFF: [usize; MAX_STR_ARRAYS] = [0; MAX_STR_ARRAYS];
+static mut SA_ELEMS: [u32; MAX_STR_ARRAYS] = [0; MAX_STR_ARRAYS];
+static mut SA_N: usize = 0;
+
+fn capture_kv_scalar(key: &[u8], u: u32, f: f32, is_float: bool) {
+    unsafe {
+        let n = KV_N;
+        if n >= MAX_KV {
+            return;
+        }
+        let len = key.len().min(MAX_KV_KEY);
+        KV_SCALARS[n].key[..len].copy_from_slice(&key[..len]);
+        KV_SCALARS[n].key_len = len;
+        KV_SCALARS[n].u = u;
+        KV_SCALARS[n].f = f;
+        KV_SCALARS[n].is_float = is_float;
+        KV_N = n + 1;
+    }
+}
+
+fn capture_string_array(key: &[u8], off: usize, elems: u32) {
+    unsafe {
+        let n = SA_N;
+        if n >= MAX_STR_ARRAYS {
+            return;
+        }
+        let len = key.len().min(MAX_SA_KEY);
+        SA_KEYS[n][..len].copy_from_slice(&key[..len]);
+        SA_KEY_LEN[n] = len;
+        SA_OFF[n] = off;
+        SA_ELEMS[n] = elems;
+        SA_N = n + 1;
+    }
+}
+
+fn keys_eq(a: &[u8], b: &[u8]) -> bool {
+    a == b
+}
+
+/// Scalar kv value (u32/i32 flavors).
+pub fn kv_u32(name: &[u8]) -> Option<u32> {
+    unsafe {
+        for i in 0..KV_N {
+            if keys_eq(&KV_SCALARS[i].key[..KV_SCALARS[i].key_len], name)
+                && !KV_SCALARS[i].is_float
+            {
+                return Some(KV_SCALARS[i].u);
+            }
+        }
+    }
+    None
+}
+
+/// Scalar kv value (f32 flavors).
+pub fn kv_f32(name: &[u8]) -> Option<f32> {
+    unsafe {
+        for i in 0..KV_N {
+            if keys_eq(&KV_SCALARS[i].key[..KV_SCALARS[i].key_len], name) && KV_SCALARS[i].is_float
+            {
+                return Some(KV_SCALARS[i].f);
+            }
+        }
+    }
+    None
+}
+
+/// Location of a string-array kv inside the parsed buffer:
+/// (byte offset of the first element's length field, element count).
+pub fn string_array(name: &[u8]) -> Option<(usize, u32)> {
+    unsafe {
+        for i in 0..SA_N {
+            if keys_eq(&SA_KEYS[i][..SA_KEY_LEN[i]], name) {
+                return Some((SA_OFF[i], SA_ELEMS[i]));
+            }
+        }
+    }
+    None
+}
+
+/// Cursor read accessors used by the capture below.
+fn cur_u32_at(data: &[u8], pos: usize) -> Option<u32> {
+    let b = data.get(pos..pos + 4)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
 /// Look up a tensor by name (exact byte match).
 pub fn find_tensor(name: &[u8]) -> Option<(&'static [u8], &'static [u64; 4], u32, u64)> {
     // Soundness: table is filled once during single-core boot, read-only after.
@@ -211,6 +329,29 @@ pub fn parse_and_dump(data: &[u8]) -> Result<GgufInfo, &'static str> {
     for _ in 0..kv_count {
         let key = cur.string()?;
         let vt = cur.u32()?;
+
+        // Capture engine-relevant metadata before/while consuming.
+        if vt == VT_U32 || vt == VT_I32 || vt == VT_F32 {
+            let raw = cur_u32_at(data, cur.pos).ok_or("gguf: truncated (kv scalar)")?;
+            let f = f32::from_bits(raw);
+            let _ = cur.u32();
+            capture_kv_scalar(key, raw, f, vt == VT_F32);
+            continue;
+        }
+        if vt == VT_ARRAY && (key == b"tokenizer.ggml.tokens" || key == b"tokenizer.ggml.merges")
+        {
+            let elem_vt = cur.u32()?;
+            let count = cur.u64()?;
+            if elem_vt != VT_STRING {
+                return Err("gguf: tokenizer array is not strings");
+            }
+            capture_string_array(key, cur.pos, count as u32);
+            // Skip the elements (u64 length + payload each).
+            for _ in 0..count {
+                let _ = cur.string()?;
+            }
+            continue;
+        }
 
         uart::write_str("gguf: kv '");
         write_name(key);
