@@ -132,6 +132,15 @@ test-pool: image-virt
 	@echo "--- serial-pool.log ---"; cat serial-pool.log
 	@grep -q "pool: PASS" serial-pool.log 		&& echo "PASS: execution pool" 		|| { echo "FAIL: execution pool"; exit 1; }
 
+## Pi-4b acceptance (qemu-virt, cortex-a76): NEON UDOT int8 matmul across
+## all cores over the loaded GGUF model tensors.
+test-matmul: export RUSTFLAGS = -C target-feature=+dotprod
+test-matmul: image-virt $(FAT_TEST_IMG)
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-matmul
+	timeout --preserve-status $(TIMEOUT) qemu-system-aarch64 -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -kernel $(VIRT_IMAGE) -drive file=$(FAT_TEST_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 > serial-mm.log 2>&1 || true
+	@echo "--- serial-mm.log ---"; cat serial-mm.log
+	@grep -q "PASS: matmul" serial-mm.log 		&& echo "PASS: matmul acceptance" 		|| { echo "FAIL: matmul acceptance"; exit 1; }
+
 ## Pi-2 acceptance (qemu-virt, PSCI): 4 cores online, exact shared counter.
 test-smp: image-virt
 	timeout --preserve-status $(TIMEOUT) $(QEMU) $(VIRTFLAGS) \
@@ -144,7 +153,7 @@ test-smp: image-virt
 clean:
 	cargo clean || true
 	rm -f $(IMAGE) $(PI5_IMAGE) $(VIRT_IMAGE) serial.log serial-exc.log serial-smp.log serial-blk.log
-	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log
+	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log
 
 distclean: clean
 	rm -rf $(HOME)/.markos-target

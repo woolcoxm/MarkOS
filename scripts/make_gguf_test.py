@@ -1,58 +1,78 @@
 #!/usr/bin/env python3
-"""Generate a minimal valid GGUF v3 test file (MODEL.BIN) for MarkOS.
+"""Generate a synthetic GGUF v3 test model for MarkOS matmul acceptance.
 
-Layout (self-consistent reference for the kernel's GGUF parser):
-- header: magic GGUF, version 3, 1 tensor, 2 metadata KVs
-- kv 'general.name' = string 'markos-test'
+Contents:
+- kv 'general.name'      = string 'markos-test'
 - kv 'general.alignment' = u32 32
-- tensor 'test.weight': dims [4,4], type F32(0), offset 0
-- data: 16 x f32 = 1.0 .. 16.0, padded to 32-byte alignment
+- tensor 'mm.a': dims [64, 16] (K x M, row-major), 16*64 bytes, u8 pattern
+- tensor 'mm.b': dims [64, 16] (K x N, row-major), 16*64 bytes, u8 pattern
+
+Byte patterns (non-negative so unsigned UDOT == signed reference math):
+  mm.a[i] = (i*7)    % 121
+  mm.b[i] = (i*11)   % 101
+
+Reference matmul (computed by --check):
+  C[m][n] = sum_k A[m*64+k] * B[n*64+k]   for m,n in 0..16
+Prints C00, C1515 and the full checksum for the Makefile gate.
 """
 import struct
 import sys
 
-def main(path: str) -> None:
+M = 16
+K = 64
+N = 16
+ALIGN = 32
+
+
+def main(path: str, check: bool) -> None:
+    a = bytes(((i * 7) % 121) for i in range(M * K))
+    b = bytes(((i * 11) % 101) for i in range(N * K))
+
+    if check:
+        c = [[sum(a[m * K + k] * b[n * K + k] for k in range(K)) for n in range(N)] for m in range(M)]
+        total = sum(sum(row) for row in c)
+        print(f"REF C00={c[0][0]} C1515={c[15][15]} SUM={total}")
+        return
+
     out = bytearray()
-    out += struct.pack("<I", 0x46554747)          # magic "GGUF"
-    out += struct.pack("<I", 3)                   # version 3
-    out += struct.pack("<Q", 1)                   # tensor_count
-    out += struct.pack("<Q", 2)                   # metadata_kv_count
+    out += struct.pack("<I", 0x46554747)      # magic "GGUF"
+    out += struct.pack("<I", 3)               # version 3
+    out += struct.pack("<Q", 2)               # tensor_count
+    out += struct.pack("<Q", 2)               # metadata_kv_count
 
     def kv_str(key: str, val: str) -> bytes:
-        b = struct.pack("<Q", len(key)) + key.encode()
-        b += struct.pack("<I", 8)                 # value type: string
-        b += struct.pack("<Q", len(val)) + val.encode()
-        return b
+        r = struct.pack("<Q", len(key)) + key.encode()
+        r += struct.pack("<I", 8) + struct.pack("<Q", len(val)) + val.encode()
+        return r
 
     def kv_u32(key: str, val: int) -> bytes:
-        b = struct.pack("<Q", len(key)) + key.encode()
-        b += struct.pack("<I", 4)                 # value type: u32
-        b += struct.pack("<I", val)
-        return b
+        r = struct.pack("<Q", len(key)) + key.encode()
+        r += struct.pack("<I", 4) + struct.pack("<I", val)
+        return r
 
     out += kv_str("general.name", "markos-test")
-    out += kv_u32("general.alignment", 32)
+    out += kv_u32("general.alignment", ALIGN)
 
-    # tensor info: test.weight, dims [4,4], F32, offset 0
-    name = b"test.weight"
-    out += struct.pack("<Q", len(name)) + name
-    out += struct.pack("<I", 2)                   # n_dims
-    out += struct.pack("<Q", 4)
-    out += struct.pack("<Q", 4)
-    out += struct.pack("<I", 0)                   # type: F32
-    out += struct.pack("<Q", 0)                   # offset in data section
+    def tensor(name: str, dims, offset: int) -> bytes:
+        r = struct.pack("<Q", len(name)) + name.encode()
+        r += struct.pack("<I", len(dims))
+        for d in dims:
+            r += struct.pack("<Q", d)
+        r += struct.pack("<I", 0)             # type 0: F32 (raw bytes reused)
+        r += struct.pack("<Q", offset)
+        return r
 
-    # pad to 32-byte alignment
-    while len(out) % 32 != 0:
+    out += tensor("mm.a", [K, M], 0)
+    out += tensor("mm.b", [K, N], len(a))
+    while len(out) % ALIGN != 0:
         out += b"\0"
-
-    # data: 16 f32 values 1.0..16.0
-    for i in range(1, 17):
-        out += struct.pack("<f", float(i))
+    out += a
+    out += b
 
     with open(path, "wb") as f:
         f.write(out)
-    print(f"wrote {path}: {len(out)} bytes")
+    print(f"wrote {path}: {len(out)} bytes (expect header+tensors ~ {ALIGN}+{len(a)+len(b)})")
+
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "tests/MODEL.BIN")
+    main(sys.argv[1], check="--check" in sys.argv)

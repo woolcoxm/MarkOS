@@ -120,6 +120,31 @@ pub struct GgufInfo {
     pub alignment: u64,
 }
 
+/// Collected tensor table (filled by parse_and_dump, no heap).
+pub const MAX_TENSORS: usize = 8;
+pub const MAX_NAME: usize = 32;
+
+static mut T_NAMES: [[u8; MAX_NAME]; MAX_TENSORS] = [[0; MAX_NAME]; MAX_TENSORS];
+static mut T_NAME_LEN: [usize; MAX_TENSORS] = [0; MAX_TENSORS];
+static mut T_DIMS: [[u64; 4]; MAX_TENSORS] = [[0; 4]; MAX_TENSORS];
+static mut T_TYPE: [u32; MAX_TENSORS] = [0; MAX_TENSORS];
+static mut T_OFFSET: [u64; MAX_TENSORS] = [0; MAX_TENSORS];
+static mut T_COUNT: usize = 0;
+
+/// Look up a tensor by name (exact byte match).
+pub fn find_tensor(name: &[u8]) -> Option<(&'static [u8], &'static [u64; 4], u32, u64)> {
+    // Soundness: table is filled once during single-core boot, read-only after.
+    unsafe {
+        for i in 0..T_COUNT {
+            let n = &T_NAMES[i][..T_NAME_LEN[i]];
+            if n == name {
+                return Some((n, &T_DIMS[i], T_TYPE[i], T_OFFSET[i]));
+            }
+        }
+    }
+    None
+}
+
 /// Parse (and log) the GGUF header of an in-memory model file.
 pub fn parse_and_dump(data: &[u8]) -> Result<GgufInfo, &'static str> {
     let mut cur = Cursor { data, pos: 0 };
@@ -178,6 +203,20 @@ pub fn parse_and_dump(data: &[u8]) -> Result<GgufInfo, &'static str> {
         }
         let ttype = cur.u32()?;
         let offset = cur.u64()?;
+
+        // Collect into the static table (first MAX_TENSORS entries).
+        unsafe {
+            let idx = T_COUNT;
+            if idx < MAX_TENSORS {
+                let nl = name.len().min(MAX_NAME);
+                T_NAMES[idx][..nl].copy_from_slice(&name[..nl]);
+                T_NAME_LEN[idx] = nl;
+                T_DIMS[idx] = dims;
+                T_TYPE[idx] = ttype;
+                T_OFFSET[idx] = offset;
+                T_COUNT = idx + 1;
+            }
+        }
 
         uart::write_str("gguf: tensor '");
         write_name(name);
