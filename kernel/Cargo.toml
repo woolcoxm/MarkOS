@@ -12,6 +12,11 @@ path = "src/main.rs"
 # Deliberately dependency-free at bring-up; platform crates are added only
 # when a phase actually needs them.
 
-# Acceptance-test builds; never enabled by default.
+# Board selection: exactly one (see board.rs). Default = Raspberry Pi.
 [features]
+default = ["board-pi"]
+board-pi = []
+board-virt = []
+
+# Acceptance-test builds; never enabled by default.
 selftest-exceptions = []

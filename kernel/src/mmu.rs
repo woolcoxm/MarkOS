@@ -25,11 +25,18 @@ struct PageTable([u64; ENTRIES]);
 static mut L0: PageTable = PageTable([0; ENTRIES]);
 static mut L1: PageTable = PageTable([0; ENTRIES]);
 static mut L2: PageTable = PageTable([0; ENTRIES]);
+/// Covers [1 GiB, 2 GiB) as Device: the BCM per-core SMP mailboxes live at
+/// 0x4000008C+ (just above the first GiB) and must be reachable.
+static mut L2B: PageTable = PageTable([0; ENTRIES]);
+/// L3 refining the first 2 MiB above 1 GiB to Device pages (mailboxes).
+static mut L3B: PageTable = PageTable([0; ENTRIES]);
 
 /// Pi 3/4 legacy peripheral base (QEMU raspi3b matches the Pi 3 layout).
 const PERIPH_BASE: u64 = 0x3F00_0000;
 const PERIPH_END: u64 = 0x4000_0000;
 const BLOCK: u64 = 2 * 1024 * 1024;
+const PAGE: u64 = 4 * 1024;
+const GIB: u64 = 1 << 30;
 
 // Descriptor bits.
 const VALID: u64 = 1 << 0;
@@ -60,9 +67,15 @@ fn build_tables() {
         let l0 = &raw mut L0;
         let l1 = &raw mut L1;
         let l2 = &raw mut L2;
+        let l2b = &raw mut L2B;
+        let l3b = &raw mut L3B;
 
+        // VA [0,1GiB): L0[0] -> L1[0] -> L2 (RAM + legacy peripherals).
+        // VA [1GiB,2GiB): L1[1] under the SAME L0 — L0 indexes bits[47:39],
+        // which are zero for these VAs; L1 indexes bits[38:30].
         (*l0).0[0] = table_addr(l1) | VALID | TABLE;
         (*l1).0[0] = table_addr(l2) | VALID | TABLE;
+        (*l1).0[1] = table_addr(l2b) | VALID | TABLE;
 
         for i in 0..ENTRIES {
             let addr = (i as u64) * BLOCK;
@@ -73,12 +86,38 @@ fn build_tables() {
             };
             (*l2).0[i] = addr | VALID | attrs;
         }
+        // [1 GiB, 2 GiB): Normal blocks — except the first 2 MiB, which on
+        // the Pi contains the per-core SMP mailboxes (0x4000008C+) and must
+        // be Device. That 2 MiB is refined to 4 KiB Device pages through an
+        // L3 table so it does not swallow the kernel mapping on QEMU virt
+        // (whose kernel sits at 0x40080000, inside the same 2 MiB).
+        (*l2b).0[0] = table_addr(l3b) | VALID | TABLE;
+        for i in 1..ENTRIES {
+            let addr = GIB + (i as u64) * BLOCK;
+            (*l2b).0[i] = addr | VALID | ATTR_NORMAL | AF;
+        }
+        for j in 0..ENTRIES {
+            let addr = GIB + (j as u64) * PAGE;
+            // Page 0 holds the SMP mailboxes (Device, execute-never);
+            // pages 1.. are Normal+executable — the kernel itself sits at
+            // 0x40080000 on the virt board, inside this 2 MiB.
+            (*l3b).0[j] = if j == 0 {
+                addr | VALID | 0b10 | ATTR_DEVICE | AF | PXN
+            } else {
+                addr | VALID | 0b10 | ATTR_NORMAL | AF
+            };
+        }
     }
 }
 
 /// Install TTBR0/TCR/MAIR and switch the MMU + caches on.
 pub fn init() {
     build_tables();
+
+    // Debug: L1[1] descriptor (covers [1GiB,2GiB) incl. SMP mailboxes).
+    let l2b0 = unsafe { ((&raw const L2B) as *const u64).add(0).read() };
+    uart::locked_write(format_args!( "mmu: l2b[0]={l2b0:#x}
+"));
 
     // Soundness: MMU-enable sequence from the ARM ARM — barriers before and
     // an isb after SCTLR changes; PC is identity-mapped so execution is

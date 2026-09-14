@@ -54,7 +54,7 @@ system console.
 
 - [x] Pi-0 — AArch64 bring-up: boots in QEMU raspi3b, `kernel alive` on PL011
 - [x] Pi-1 — MMU page tables, exception vectors (VBAR), generic timer
-- [ ] Pi-2 — GIC-400, SMP: all cores online, shared-counter acceptance
+- [x] Pi-2 — SMP: all cores online (PSCI on qemu-virt; spin-table+mailbox on Pi hw), shared-counter acceptance
 - [ ] Pi-3 — SD card driver (SDHCI) + minimal FAT reader + GGUF load
 - [ ] Pi-4 — NEON int8 matmul kernels (UDOT), work-stealing pool, 2 MiB blocks
 - [ ] Pi-5 — Network: GENET (Pi 4) / Pi 5 path, minimal TCP, inference+control protocol

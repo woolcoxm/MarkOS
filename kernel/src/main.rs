@@ -1,19 +1,25 @@
 //! MarkOS — a bare-metal Raspberry Pi unikernel that boots straight into an
 //! LLM inference engine.
 //!
-//! Pi-1 (this commit): exception level normalization (EL3/EL2 → EL1), the
-//! VBAR_EL1 vector table with a full-register shared trap handler, MMU
-//! enable over an identity map of the first GiB (2 MiB blocks, caches on),
-//! and the generic timer (counter reads + counter-based delays).
+//! Pi-2 (this commit): SMP — every core the firmware starts (or PSCI
+//! releases) is brought online through `secondary_main`, contributing to an
+//! exact shared-counter acceptance test. Release paths: ARM64 spin-table
+//! (Pi firmware/QEMU raspi), PSCI CPU_ON (QEMU virt), legacy CORE_RELEASE
+//! (cores that entered our own stub).
 //!
 //! owns: the kernel entry point and the boot stack.
-//! invariants: non-BSP cores stay parked until the SMP phase; exceptions
-//! are terminal except the deliberately-resumable `brk` selftest.
+//! invariants: non-BSP cores park in the stub (or firmware parking) until
+//! smp::start_aps releases them; interrupts stay masked until the GIC phase.
 
 #![no_std]
 #![no_main]
 
+mod board;
+mod board_release;
+mod cpu;
 mod mmu;
+mod psci;
+mod smp;
 mod timer;
 mod uart;
 mod vectors;
@@ -24,26 +30,14 @@ global_asm!(
     ".section .text.boot",
     ".globl _start",
     "_start:",
-    // NOTE: boot-critical asm must not use `ldr =symbol` literal pools —
-    // LLVM places pools in ways the linker script can silently corrupt once
-    // more .text blobs exist (seen live: pool landed inside the vector
-    // table's NOP padding). PC-relative adr/adrp and encodable movs only.
-    "    ldr x4, =0x3F201000",     // (debug) PL011 DR, pre-init write works
-    "    mov w5, #83",             // 'S'
-    "    str w5, [x4]",
+    // The firmware/QEMU starts every core here; park all but core 0.
     "    mrs x0, mpidr_el1",
     "    and x0, x0, #3",          // affinity level 0 = core id on the Pi
-    "    cbnz x0, parked",
-    "    mov w5, #99",             // 'c' passed core check
-    "    str w5, [x4]",
+    "    cbnz x0, secondary_wait",
     "",
     // Normalize the exception level to EL1. Boards differ: QEMU's raspi
     // machines, the Pi's armstub, and bare boot ROM entries hand the kernel
     // EL1, EL2, or EL3 — everything below assumes EL1, so drop explicitly.
-    "    mrs x0, CurrentEL",
-    "    lsr x0, x0, #2",
-    "    add x0, x0, #48",         // digit of the starting EL
-    "    str w0, [x4]",
     "    mrs x0, CurrentEL",
     "    cmp x0, #0xC",            // EL3
     "    b.eq from_el3",
@@ -52,10 +46,7 @@ global_asm!(
     "    b el_ready",
     "",
     "from_el3:",
-    "    mov w5, #51",             // '3'
-    "    str w5, [x4]",
-    "    mov x1, #0x400",
-    "    orr x1, x1, #1",          // SCR_EL3: NS=1, RW=1 (lower EL is AArch64)
+    "    mov x1, #0x401",          // SCR_EL3: NS=1, RW=1 (lower EL is AArch64)
     "    msr scr_el3, x1",
     "    msr cptr_el3, xzr",       // no FP/SIMD traps from EL3
     "    adr x1, el_ready",
@@ -65,12 +56,10 @@ global_asm!(
     "    eret",
     "",
     "from_el2:",
-    "    mov w5, #50",             // '2'
-    "    str w5, [x4]",
     "    mov x1, #0x80000000",     // HCR_EL2.RW=1 (EL1 is AArch64)
     "    msr hcr_el2, x1",
-    "    mov w5, #104",            // 'h' — hcr written
-    "    str w5, [x4]",
+    // NOTE: no `msr cptr_el2` here — CPTR_EL2 is ARMv8.1+; on the v8.0
+    // Cortex-A53 (QEMU raspi3b) it is unallocated and would fault.
     "    adr x1, el_ready",
     "    msr elr_el2, x1",
     "    mov x1, #0x3C5",          // SPSR: DAIF masked, EL1h
@@ -78,15 +67,11 @@ global_asm!(
     "    eret",
     "",
     "el_ready:",
-    "    mov w5, #76",             // 'L' reached el_ready
-    "    str w5, [x4]",
     "    msr spsel, #1",           // use SP_EL1 as the kernel stack
-    "    mov w5, #115",            // 's' stack selected
-    "    str w5, [x4]",
     "    adrp x0, __stack_top",
     "    add x0, x0, :lo12:__stack_top",
     "    mov sp, x0",
-    "    mov x1, #(3 << 20)",      // CPACR_EL1.FPEN: allow FP/NEON
+    "    mov x1, #(3 << 20)",      // CPACR_EL1.FPEN: allow FP/NEON (inference kernels)
     "    msr cpacr_el1, x1",
     // Zero .bss — the loader makes no guarantees about it.
     "    adrp x0, __bss_start",
@@ -99,12 +84,26 @@ global_asm!(
     "    stp xzr, xzr, [x0], #16",
     "    b 1b",
     "2:",
-    "    mov w5, #75",             // 'K' calling kmain
-    "    str w5, [x4]",
     "    bl kmain",
     // Should never return; if it does, park here too.
     "parked:",
     "    wfe",
+    "    b parked",
+    "",
+    // Cores 1..3 spin here from the moment they enter the kernel. The BSP
+    // publishes each core's private stack top into CORE_RELEASE[core] and
+    // wakes everyone with sev; the released core adopts that stack and
+    // calls secondary_main. x0 keeps the core id for secondary_main.
+    "secondary_wait:",
+    "    adrp x1, CORE_RELEASE",
+    "    add x1, x1, :lo12:CORE_RELEASE",
+    "    add x1, x1, x0, lsl #3",
+    "1:",
+    "    wfe",
+    "    ldr x2, [x1]",
+    "    cbz x2, 1b",
+    "    mov sp, x2",
+    "    bl secondary_main",
     "    b parked",
 );
 
@@ -120,7 +119,8 @@ fn current_el() -> u8 {
 extern "C" fn kmain() -> ! {
     uart::init();
     uart::write_str("kernel alive\n");
-    let _ = core::fmt::write(&mut uart::Serial, format_args!("boot: running at EL{}\n", current_el()));
+    uart::locked_write(format_args!("boot: board={} running at EL{}\n", board::NAME, current_el()),
+    );
 
     vectors::init();
     uart::write_str("vectors: VBAR_EL1 installed, DAIF masked\n");
@@ -129,13 +129,31 @@ extern "C" fn kmain() -> ! {
     mmu::log();
 
     timer::log();
+    cpu::log();
 
     uart::write_str("cpu bring-up complete\n");
+
+    // SMP: release the parked cores and verify all of them are live.
+    match smp::start_aps(board::CORE_COUNT) {
+        Ok((aps, work_expected)) => {
+            smp::bsp_do_work();
+            let work = smp::work_total();
+            let aps_expected = board::CORE_COUNT - 1;
+            let ok = aps as usize == aps_expected && work == work_expected;
+            uart::locked_write(format_args!(
+                    "smp: {aps}/{aps_expected} APs online, shared counter {work}/{work_expected} — {}\n",
+                    if ok { "PASS" } else { "FAIL" }
+                ));
+        }
+        Err(e) => {
+            uart::locked_write(format_args!("smp: {e}\n"));
+        }
+    }
 
     #[cfg(feature = "selftest-exceptions")]
     selftest_exceptions();
 
-    // The selftests above are diverging, so this loop is unreachable when a
+    // The selftests below are diverging, so this loop is unreachable when a
     // selftest feature is enabled — that is expected, not a bug.
     #[allow(unreachable_code)]
     loop {
@@ -165,7 +183,9 @@ fn selftest_exceptions() -> ! {
     uart::write_str("PASS: brk caught and execution resumed\n");
 
     uart::write_str("selftest: triggering data abort (read of unmapped VA)\n");
-    let addr: u64 = 0x0000_4000_0000; // 16 GiB — outside the 1 GiB identity map
+    // 4 TiB: canonical, beyond the [0,2GiB) identity map -> level-0
+    // translation fault. (0x40000000 itself is now mapped!)
+    let addr: u64 = 0x0000_0400_0000_0000;
     // Soundness: the deliberate fault is the whole point; raw asm so the
     // dereference address is exactly `addr`.
     unsafe {
@@ -184,6 +204,6 @@ fn selftest_exceptions() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     uart::write_str("KERNEL PANIC: ");
-    let _ = core::fmt::write(&mut uart::Serial, format_args!("{}\n", info));
+    uart::locked_write(format_args!("{}\n", info));
     park()
 }

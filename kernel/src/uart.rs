@@ -1,17 +1,14 @@
 //! PL011 UART — the serial debug console.
 //!
-//! owns: nothing; the UART is platform hardware.
+//! owns: nothing; the UART is platform hardware. The base address comes
+//! from the board layer (see board.rs).
 //! invariants: single-writer at a time during bring-up; later phases route
 //! all output through a lock.
-//!
-//! Board base addresses (selected by the board layer as it lands):
-//!   QEMU raspi3b : 0x3F201000 (emulates Pi 3-era PL011)
-//!   Pi 4 (BCM2711): 0xFE201000
-//!   Pi 5          : via RP1 — handled by the Pi 5 board layer, not yet.
 
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-const UART0_BASE: usize = 0x3F20_1000;
+const UART0_BASE: usize = crate::board::UART_BASE;
 
 // PL011 register offsets.
 const DR: usize = 0x00;
@@ -50,6 +47,23 @@ pub fn write_byte(b: u8) {
         }
         reg(DR).write_volatile(b as u32);
     }
+}
+
+/// Serial transmit lock: cores print concurrently once SMP is up; without
+/// this, multi-core log lines interleave mid-write (observed live).
+static TX_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Lock-protected formatted write: the whole line lands as one unit, so
+/// multi-core output does not interleave mid-line.
+pub fn locked_write(args: fmt::Arguments) {
+    while TX_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    let _ = fmt::write(&mut Serial, args);
+    TX_LOCK.store(false, Ordering::Release);
 }
 
 pub fn write_str(s: &str) {
