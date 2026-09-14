@@ -1,0 +1,12 @@
+[package]
+name = "markos-kernel"
+version = "0.1.0"
+edition = "2024"
+description = "MarkOS: single-purpose x86_64 unikernel for LLM inference"
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+
+[dependencies]
+limine = "0.6"

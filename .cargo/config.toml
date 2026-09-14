@@ -1,0 +1,6 @@
+# Workspace-level cargo configuration.
+# A custom JSON target cannot use the precompiled sysroot core, so we build
+# core + compiler_builtins from source (requires nightly + rust-src component).
+
+[unstable]
+build-std = ["core", "compiler_builtins"]

@@ -1,0 +1,10 @@
+# Build outputs
+/iso_root/
+*.iso
+serial.log
+
+# Vendored Limine binaries: reproducible via `make deps` (pinned v12.9.0)
+/third_party/
+
+# Rust
+/target/
