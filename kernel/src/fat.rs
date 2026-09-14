@@ -11,7 +11,6 @@
 //! invariants: `mount` runs once on the BSP; all buffers passed in by
 //! callers are identity-mapped RAM.
 
-use core::fmt::Write as _;
 
 use crate::uart;
 

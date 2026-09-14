@@ -17,7 +17,6 @@
 //!   other; the deployment boards (Pi 4/5, A72/A76) are coherent.
 
 use core::arch::global_asm;
-use core::fmt::Write as _;
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 

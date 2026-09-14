@@ -6,8 +6,7 @@
 
 #[cfg(feature = "board-virt")]
 mod imp {
-    use core::arch::asm;
-
+    
     /// PSCI CPU_ON — QEMU virt implements PSCI 0.2 over HVC.
     pub fn release_core(core: u64, entry: u64) {
         let status = crate::psci::cpu_on(core, entry, 0);

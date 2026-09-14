@@ -17,7 +17,6 @@
 
 use core::fmt::Write as _;
 use core::hint::spin_loop;
-use core::ptr;
 
 use crate::uart;
 

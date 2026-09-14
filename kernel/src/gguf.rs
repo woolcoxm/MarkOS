@@ -9,15 +9,13 @@
 //! invariants: all reads are bounds-checked — malformed input yields Err,
 //! never a panic (no-panic policy for steady-state paths).
 
-use core::fmt::Write as _;
+#![allow(dead_code)] // VT_* constants document the on-disk format
 
 use crate::uart;
-use core::arch::asm;
 
 const MAGIC_GGUF: u32 = 0x4655_4747; // "GGUF" little-endian
 
 // GGUF metadata value types (format documentation; not all are matched).
-#![allow(dead_code)]
 const VT_U8: u32 = 0;
 const VT_I8: u32 = 1;
 const VT_U16: u32 = 2;
