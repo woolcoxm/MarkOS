@@ -199,6 +199,19 @@ test-pcie: image-virt
 		&& echo "PASS: pcie enumeration" \
 		|| { echo "FAIL: pcie enumeration"; exit 1; }
 
+## Pi-8 acceptance (qemu-virt, cortex-a76): soak — dozens of control
+## transactions (remote RUN + ECHO per round) over one TCP connection.
+## RX-ring wraparound and connection-state bugs die here.
+test-soak: export RUSTFLAGS = -C target-feature=+dotprod
+test-soak: image-virt $(FAT_TEST_IMG)
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-net
+	bash scripts/kill_qemu.sh; sleep 1; \
+	timeout 60 $(QEMU) -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -kernel $(VIRT_IMAGE) -drive file=$(FAT_TEST_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-soak.log 2>&1 & qpid=$$!; \
+	sleep 4; \
+	python3 scripts/soak_client.py 127.0.0.1 8080 40 > client-soak.log 2>&1; rc=$$?; tail -3 client-soak.log; \
+	kill $$qpid 2>/dev/null; \
+	[ $$rc -eq 0 ] && echo "PASS: soak" || { echo "FAIL: soak"; exit 1; }
+
 ## Pi-2 acceptance (qemu-virt, PSCI): 4 cores online, exact shared counter.
 test-smp: image-virt
 	timeout --preserve-status $(TIMEOUT) $(QEMU) $(VIRTFLAGS) \
@@ -211,7 +224,7 @@ test-smp: image-virt
 clean:
 	cargo clean || true
 	rm -f $(IMAGE) $(PI5_IMAGE) $(VIRT_IMAGE) serial.log serial-exc.log serial-smp.log serial-blk.log
-	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log serial-net.log client.log serial-ctl.log client-ctl.log serial-inst.log client-inst.log net.pcap
+	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log serial-net.log client.log serial-ctl.log client-ctl.log serial-soak.log client-soak.log serial-inst.log client-inst.log net.pcap
 
 distclean: clean
 	rm -rf $(HOME)/.markos-target
