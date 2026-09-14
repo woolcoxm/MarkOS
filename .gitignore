@@ -2,6 +2,7 @@
 *.img
 serial.log
 serial-*.log
+client-*.log
 
 # Rust
 /target/

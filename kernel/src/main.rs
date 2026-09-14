@@ -15,6 +15,7 @@
 mod board;
 mod board_release;
 mod cache;
+mod control;
 mod cpu;
 mod fat;
 mod gguf;
@@ -200,6 +201,7 @@ extern "C" fn kmain() -> ! {
     }
 }
 
+#[cfg(feature = "selftest-matmul")]
 fn selftest_matmul() -> ! {
     uart::write_str("selftest: NEON UDOT int8 matmul over the loaded GGUF model
 ");

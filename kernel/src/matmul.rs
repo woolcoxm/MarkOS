@@ -45,8 +45,14 @@ pub fn matmul_scalar(a: &[u8], b: &[u8], c: &mut [i32]) {
 
 /// Compute rows [m_start, m_end) of C with the NEON UDOT path.
 ///
+/// Per-function dotprod: the kernel ships in builds whose global target
+/// (cortex-a53 dev images) lacks the feature; enabling it just for this
+/// function lets the asm assemble everywhere while cpu::has_dotprod gates
+/// the call at runtime.
+///
 /// Soundness: a/b/c are the module-owned buffers; each core writes only its
 /// own row range; NEON temps v0/v1/v2 are scratch within each asm block.
+#[target_feature(enable = "dotprod")]
 pub unsafe fn matmul_udot_rows(a: &[u8], b: &[u8], c: &mut [i32], m_start: usize, m_end: usize) {
     for m in m_start..m_end {
         for n in 0..N {

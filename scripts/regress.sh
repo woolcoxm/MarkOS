@@ -11,6 +11,10 @@ cd "$(dirname "$0")/.."
 # a rebuild that feature-gated edits require.
 find kernel/src -name '*.rs' -exec touch {} +
 
+# Stray QEMUs from interrupted runs hold tests/fat.img and port 8080.
+pkill -f "^qemu-system-[a]arch64" 2>/dev/null
+sleep 1
+
 gates=(test-exceptions test-smp test-block test-fat test-pool test-matmul test-net)
 [ $# -gt 0 ] && gates=("$@")
 

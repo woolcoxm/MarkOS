@@ -142,13 +142,30 @@ test-matmul: image-virt $(FAT_TEST_IMG)
 	@grep -q "PASS: matmul" serial-mm.log 		&& echo "PASS: matmul acceptance" 		|| { echo "FAIL: matmul acceptance"; exit 1; }
 
 ## Pi-5 acceptance (qemu-virt): TCP MARKOS-PING -> MARKOS-PONG end to end.
+## Leftover QEMUs from earlier runs hold fat.img/port 8080 and poison the
+## gate, so clear them first and kill our own QEMU before the verdict.
 test-net: image-virt $(FAT_TEST_IMG)
 	$(MAKE) image-virt KERNEL_FEATURES=selftest-net
-	(timeout 25 $(QEMU) -M virt -cpu cortex-a53 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -kernel $(VIRT_IMAGE) -drive file=$(FAT_TEST_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-net.log 2>&1 &)
-	sleep 4
-	python3 scripts/net_client.py 127.0.0.1 8080 || true
-	sleep 2
-	@grep -aq "net: PASS" serial-net.log 		&& echo "PASS: network ping/pong" 		|| { echo "FAIL: network ping/pong"; exit 1; }
+	bash scripts/kill_qemu.sh; sleep 1; \
+	timeout 25 $(QEMU) -M virt -cpu cortex-a53 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -kernel $(VIRT_IMAGE) -drive file=$(FAT_TEST_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-net.log 2>&1 & qpid=$$!; \
+	sleep 4; \
+	python3 scripts/net_client.py 127.0.0.1 8080 || true; \
+	sleep 2; \
+	kill $$qpid 2>/dev/null; \
+	grep -aq "net: PASS" serial-net.log && echo "PASS: network ping/pong" || { echo "FAIL: network ping/pong"; exit 1; }
+
+## Pi-5b acceptance (qemu-virt, cortex-a76): control protocol over TCP —
+## HELLO/STATUS/LOAD/RUN; RUN computes the UDOT matmul on all cores, so the
+## dotprod target feature is required (as in test-matmul).
+test-control: export RUSTFLAGS = -C target-feature=+dotprod
+test-control: image-virt $(FAT_TEST_IMG)
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-net
+	bash scripts/kill_qemu.sh; sleep 1; \
+	timeout 30 $(QEMU) -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -kernel $(VIRT_IMAGE) -drive file=$(FAT_TEST_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-ctl.log 2>&1 & qpid=$$!; \
+	sleep 4; \
+	python3 scripts/control_client.py 127.0.0.1 8080 > client-ctl.log 2>&1; rc=$$?; cat client-ctl.log; \
+	kill $$qpid 2>/dev/null; \
+	[ $$rc -eq 0 ] && echo "PASS: control protocol" || { echo "FAIL: control protocol"; exit 1; }
 
 ## Pi-2 acceptance (qemu-virt, PSCI): 4 cores online, exact shared counter.
 test-smp: image-virt
@@ -162,7 +179,7 @@ test-smp: image-virt
 clean:
 	cargo clean || true
 	rm -f $(IMAGE) $(PI5_IMAGE) $(VIRT_IMAGE) serial.log serial-exc.log serial-smp.log serial-blk.log
-	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log serial-net.log client.log
+	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log serial-net.log client.log serial-ctl.log client-ctl.log net.pcap
 
 distclean: clean
 	rm -rf $(HOME)/.markos-target

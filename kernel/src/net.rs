@@ -282,12 +282,18 @@ pub fn poll() {
         let q = &raw mut QRX_Q;
         let used_idx = (*q).used.idx;
         while RX_LAST_SEEN != used_idx {
-            let slot = (RX_LAST_SEEN as usize) % QSIZE;
+            let used_slot = (RX_LAST_SEEN as usize) % QSIZE;
             RX_LAST_SEEN = RX_LAST_SEEN.wrapping_add(1);
+            // Which chain came back: the used element carries the head
+            // descriptor id (2*buffer). The used-ring POSITION must not be
+            // reused as the buffer index — with 8 posted chains in a
+            // 32-entry used ring they diverge after the first wrap.
+            let slot = ((*q).used.ring[used_slot].id as usize / 2) % 8;
             // The frame lives in the RX_FRAME[slot] buffer (after the 12-byte
             // vnet header the device wrote into RX_HDR[slot]).
             let len = {
-                let elem_len = ((*q).used.ring[slot].len as usize).saturating_sub(VNET_HDR);
+                let elem_len =
+                    ((*q).used.ring[used_slot].len as usize).saturating_sub(VNET_HDR);
                 elem_len.min(FRAME_MAX)
             };
             // Invalidate before the CPU reads the DMA-written frame.

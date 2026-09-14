@@ -104,19 +104,36 @@ pub fn input(seg: &[u8], src_ip: [u8; 4], src_mac: [u8; 6]) {
     }
 }
 
-/// Protocol handler for received payloads.
+/// Protocol handler for received payloads: the MARKOS-PING transport probe,
+/// then the control protocol; anything else echoes (transport bring-up aid).
 fn handle_payload(payload: &[u8]) {
     if payload == b"MARKOS-PING" {
-        let pong = b"MARKOS-PONG";
-        tcp_send_seg(snd_nxt_load(), rcv_nxt_load(), FLAG_PSH | FLAG_ACK, pong);
-        snd_nxt_store(snd_nxt_load().wrapping_add(pong.len() as u32));
+        reply(b"MARKOS-PONG");
         uart::write_str("net: PASS ping/pong round trip\n");
-    } else {
-        // Generic echo for unknown payloads (transport bring-up aid).
-        let echo: &[u8] = payload;
-        tcp_send_seg(snd_nxt_load(), rcv_nxt_load(), FLAG_PSH | FLAG_ACK, echo);
-        snd_nxt_store(snd_nxt_load().wrapping_add(echo.len() as u32));
+        return;
     }
+    let mut resp = [0u8; 512];
+    let n = crate::control::dispatch(payload, &mut resp);
+    if n > 0 {
+        // Responses are lines: guarantee the trailing newline the client
+        // reads to (dispatch content may omit it).
+        let n = if resp[n - 1] != b'\n' {
+            resp[n] = b'\n';
+            n + 1
+        } else {
+            n
+        };
+        uart::locked_write(format_args!("control: replied {} bytes\n", n));
+        reply(&resp[..n]);
+    } else {
+        reply(payload);
+    }
+}
+
+/// Send payload to the peer and advance SND_NXT.
+fn reply(payload: &[u8]) {
+    tcp_send_seg(snd_nxt_load(), rcv_nxt_load(), FLAG_PSH | FLAG_ACK, payload);
+    snd_nxt_store(snd_nxt_load().wrapping_add(payload.len() as u32));
 }
 
 fn snd_nxt_load() -> u32 {
