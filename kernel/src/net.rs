@@ -71,10 +71,11 @@ const ETYPE_IP: u16 = 0x0800;
 const PROTO_ICMP: u8 = 1;
 const PROTO_TCP: u8 = 6;
 
-/// Appliance static addresses (QEMU slirp defaults; the installer bakes
-/// these for real deployments later).
-const OUR_IP: [u8; 4] = [10, 0, 2, 15];
-pub const LISTEN_PORT: u16 = 8080;
+/// Appliance IPv4 — set at boot from MARKOS.CFG (installer-baked); slirp
+/// default until config loads.
+fn our_ip_cfg() -> [u8; 4] {
+    crate::config::ip()
+}
 
 static mut NET_BASE: u64 = 0;
 static mut OUR_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -251,7 +252,7 @@ pub fn init() -> Result<(), &'static str> {
 
 /// Our appliance IPv4 address.
 pub fn our_ip() -> [u8; 4] {
-    OUR_IP
+    our_ip_cfg()
 }
 
 pub fn mac_string(buf: &mut [u8]) -> usize {
@@ -349,7 +350,7 @@ fn handle_arp(frame: &[u8], body: &[u8], src_mac: [u8; 6]) {
         return; // only requests
     }
     let target_ip = [body[24], body[25], body[26], body[27]];
-    if target_ip != OUR_IP {
+    if target_ip != our_ip_cfg() {
         return;
     }
     // Reply: eth header + 28-byte ARP reply.
@@ -364,7 +365,7 @@ fn handle_arp(frame: &[u8], body: &[u8], src_mac: [u8; 6]) {
     arp[5] = 4;
     arp[6..8].copy_from_slice(&2u16.to_be_bytes());      // op: reply
     arp[8..14].copy_from_slice(&our_mac());
-    arp[14..18].copy_from_slice(&OUR_IP);
+    arp[14..18].copy_from_slice(&our_ip_cfg());
     arp[18..24].copy_from_slice(&body[18..24]);          // sender (their) MAC/IP
     arp[24..28].copy_from_slice(&body[14..18]);          // target: requester IP
     net_send(&out);
@@ -382,7 +383,7 @@ fn handle_ip(body: &[u8], src_mac: [u8; 6]) {
     let proto = body[9];
     let src_ip = [body[12], body[13], body[14], body[15]];
     let dst_ip = [body[16], body[17], body[18], body[19]];
-    if dst_ip != OUR_IP {
+    if dst_ip != our_ip_cfg() {
         return;
     }
     let ihl = (body[0] & 0xF) as usize * 4;
@@ -409,7 +410,7 @@ fn handle_icmp(ip_hdr: &[u8], payload: &[u8], src_mac: [u8; 6]) {
     ip[2..4].copy_from_slice(&total.to_be_bytes());
     ip[8] = 64;
     ip[9] = PROTO_ICMP;
-    ip[12..16].copy_from_slice(&OUR_IP);
+    ip[12..16].copy_from_slice(&our_ip_cfg());
     ip[16..20].copy_from_slice(&ip_hdr[12..16]);
     let csum = ip_checksum(&ip[..20]);
     ip[10..12].copy_from_slice(&csum);
@@ -463,7 +464,7 @@ pub fn ip_send(dst_mac: &[u8; 6], dst_ip: &[u8; 4], proto: u8, payload: &[u8]) {
     ip[2..4].copy_from_slice(&total.to_be_bytes());
     ip[8] = 64;
     ip[9] = proto;
-    ip[12..16].copy_from_slice(&OUR_IP);
+    ip[12..16].copy_from_slice(&our_ip_cfg());
     ip[16..20].copy_from_slice(dst_ip);
     let csum = ip_checksum(&ip[..20]);
     ip[10..12].copy_from_slice(&csum);

@@ -145,13 +145,17 @@ impl FatVolume {
 
     /// Find `MODEL.BIN` (raw 8.3 short name) in the root directory.
     pub fn open_model(&self) -> Result<File, &'static str> {
-        // Short name: "MODEL" padded to 8 + "BIN"; case-insensitive compare.
         let mut want = [0x20u8; 11];
         want[..5].copy_from_slice(b"MODEL");
         want[8..11].copy_from_slice(b"BIN");
+        self.open_short(&want)
+            .map_err(|_| "MODEL.BIN not found in volume root")
+    }
 
+    /// Find a file by raw 8.3 short name (11 bytes, space padded) in the
+    /// volume root directory.
+    pub fn open_short(&self, want: &[u8; 11]) -> Result<File, &'static str> {
         let mut found: Option<File> = None;
-        let mut done = false;
         self.for_each_cluster(self.root_cluster, |chunk| {
             for e in 0..chunk.len() / 32 {
                 let entry = &chunk[e * 32..(e + 1) * 32];
@@ -170,14 +174,12 @@ impl FatVolume {
                         first_cluster: (rd16(entry, 20) as u32) << 16 | rd16(entry, 26) as u32,
                         size: rd32(entry, 28),
                     });
-                    done = true;
                     return false;
                 }
             }
             true
         })?;
-        let _ = done;
-        found.ok_or("MODEL.BIN not found in volume root")
+        found.ok_or("entry not found in volume root")
     }
 
     /// Read the entire file into `buf`; returns the number of bytes read.

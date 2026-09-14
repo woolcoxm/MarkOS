@@ -15,7 +15,7 @@
 //! responses are formatted into a caller-provided fixed buffer. Commands
 //! must arrive in one TCP segment (Pi-8 hardening: reassembly).
 
-use crate::{board, cache, cpu, fat, gguf, matmul, pool, timer, virtio_blk};
+use crate::{board, cache, config, cpu, fat, gguf, matmul, pool, timer, uart, virtio_blk};
 use core::fmt;
 
 const MODEL_CAP: usize = 65536;
@@ -26,6 +26,37 @@ static mut MODEL_TENSORS: u64 = 0;
 static mut DATA_START: u64 = 0;
 static mut BLK_UP: bool = false;
 static mut SERVED: u64 = 0;
+static mut AUTHED: bool = false;
+
+/// Boot-time configuration (Pi-6): read MARKOS.CFG from the SD root. Must
+/// run before net::init — the appliance IP/port/token take effect from it.
+pub fn boot() {
+    match boot_config() {
+        Ok(()) => {
+            let mut buf = [0u8; 96];
+            let n = config::describe(&mut buf);
+            let s = core::str::from_utf8(&buf[..n]).unwrap_or("cfg: ?\n");
+            uart::write_str(s);
+        }
+        Err(e) => {
+            uart::locked_write(format_args!("cfg: defaults ({e})\n"));
+        }
+    }
+}
+
+fn boot_config() -> Result<(), &'static str> {
+    ensure_blk()?;
+    config::load_from_sd()
+}
+
+/// One-time virtio-blk bring-up; the device stays configured afterwards.
+fn ensure_blk() -> Result<(), &'static str> {
+    if !unsafe { BLK_UP } {
+        virtio_blk::init()?;
+        unsafe { BLK_UP = true };
+    }
+    Ok(())
+}
 
 /// Format adapter: append into a fixed byte buffer, truncating at capacity.
 struct BufW<'a> {
@@ -62,11 +93,22 @@ pub fn dispatch(payload: &[u8], out: &mut [u8]) -> usize {
         None => (line, &[] as &[u8]),
     };
     unsafe { SERVED += 1 };
+    let authed = unsafe { AUTHED };
 
     let mut w = BufW { buf: out, len: 0 };
     match verb {
-        b"HELLO" => hello(&mut w),
-        b"MARKOS" if arg == b"HELLO" => hello(&mut w),
+        b"HELLO" => {
+            if token_ok(arg) {
+                unsafe { AUTHED = true };
+                hello(&mut w);
+            } else {
+                let _ = fmt::write(&mut w, format_args!("ERR auth"));
+            }
+        }
+        // Every command except HELLO requires a prior authenticated HELLO.
+        _ if !authed => {
+            let _ = fmt::write(&mut w, format_args!("ERR auth"));
+        }
         b"STATUS" => status(&mut w),
         b"LOAD" => load(&mut w),
         b"RUN" => run(&mut w),
@@ -80,6 +122,13 @@ pub fn dispatch(payload: &[u8], out: &mut [u8]) -> usize {
         _ => return 0,
     }
     w.len
+}
+
+/// HELLO token check: the installer bakes the admin token into MARKOS.CFG;
+/// an unset token accepts any HELLO (development convenience only).
+fn token_ok(arg: &[u8]) -> bool {
+    let tok = config::token();
+    tok.is_empty() || arg == tok
 }
 
 fn hello(w: &mut BufW) {
@@ -107,13 +156,9 @@ fn status(w: &mut BufW) {
 }
 
 fn load(w: &mut BufW) {
-    // One-time virtio-blk bring-up; the device stays configured afterwards.
-    if !unsafe { BLK_UP } {
-        if let Err(e) = virtio_blk::init() {
-            let _ = fmt::write(w, format_args!("ERR blk {e}"));
-            return;
-        }
-        unsafe { BLK_UP = true };
+    if let Err(e) = ensure_blk() {
+        let _ = fmt::write(w, format_args!("ERR blk {e}"));
+        return;
     }
     let vol = match fat::mount() {
         Ok(v) => v,

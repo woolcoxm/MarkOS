@@ -19,6 +19,7 @@ PI5_IMAGE    := kernel_2712.img
 VIRT_IMAGE   := virt.img
 FAT_TEST_IMG := tests/fat.img
 TEST_IMG     := tests/test.img
+INSTALL_IMG  := tests/install.img
 SD_DIR       := sd
 
 # Ubuntu's objcopy lacks AArch64 support; rustup's LLVM tooling has it.
@@ -167,6 +168,26 @@ test-control: image-virt $(FAT_TEST_IMG)
 	kill $$qpid 2>/dev/null; \
 	[ $$rc -eq 0 ] && echo "PASS: control protocol" || { echo "FAIL: control protocol"; exit 1; }
 
+## Installer-baked appliance image (Pi-6): kernel + MODEL.BIN + MARKOS.CFG.
+## The config here (port 8081, token) is what the kernel must pick up at
+## boot for the test-install gate to pass.
+$(INSTALL_IMG): image-virt tests/MODEL.BIN scripts/install.py
+	python3 scripts/install.py --image $(INSTALL_IMG) --kernel $(VIRT_IMAGE) \
+		--model tests/MODEL.BIN --ip 10.0.2.15 --port 8081 --token SEKRIT-TOKEN-1
+
+## Pi-6 acceptance (qemu-virt, cortex-a76): boot with installer-baked
+## config — control comes up on the configured port and the token is
+## enforced; wrong-token HELLOs are rejected, then the full flow runs.
+test-install: export RUSTFLAGS = -C target-feature=+dotprod
+test-install: $(INSTALL_IMG)
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-net
+	bash scripts/kill_qemu.sh; sleep 1; \
+	timeout 30 $(QEMU) -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -kernel $(VIRT_IMAGE) -drive file=$(INSTALL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8081-:8081 > serial-inst.log 2>&1 & qpid=$$!; \
+	sleep 4; \
+	python3 scripts/control_client.py 127.0.0.1 8081 SEKRIT-TOKEN-1 > client-inst.log 2>&1; rc=$$?; cat client-inst.log; \
+	kill $$qpid 2>/dev/null; \
+	[ $$rc -eq 0 ] && echo "PASS: install config + auth" || { echo "FAIL: install config + auth"; exit 1; }
+
 ## Pi-2 acceptance (qemu-virt, PSCI): 4 cores online, exact shared counter.
 test-smp: image-virt
 	timeout --preserve-status $(TIMEOUT) $(QEMU) $(VIRTFLAGS) \
@@ -179,7 +200,7 @@ test-smp: image-virt
 clean:
 	cargo clean || true
 	rm -f $(IMAGE) $(PI5_IMAGE) $(VIRT_IMAGE) serial.log serial-exc.log serial-smp.log serial-blk.log
-	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log serial-net.log client.log serial-ctl.log client-ctl.log net.pcap
+	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log serial-net.log client.log serial-ctl.log client-ctl.log serial-inst.log client-inst.log net.pcap
 
 distclean: clean
 	rm -rf $(HOME)/.markos-target

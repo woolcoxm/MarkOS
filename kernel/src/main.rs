@@ -15,6 +15,7 @@
 mod board;
 mod board_release;
 mod cache;
+mod config;
 mod control;
 mod cpu;
 mod fat;
@@ -366,15 +367,19 @@ fn selftest_matmul() -> ! {
 /// MARKOS-PONG for the transport acceptance gate.
 #[cfg(feature = "selftest-net")]
 fn selftest_net() -> ! {
+    // Installer-baked config first: it sets the control IP/port/token.
+    control::boot();
     match net::init() {
         Ok(()) => {
             let mut mac = [0u8; 18];
             let m = net::mac_string(&mut mac);
+            let ip = config::ip();
             uart::locked_write(format_args!(
-                "net: virtio-net up mac={:?} ip=10.0.2.15:{}
+                "net: virtio-net up mac={:?} ip={}.{}.{}.{}:{}
 ",
                 core::str::from_utf8(&mac[..m]).unwrap_or("?"),
-                net::LISTEN_PORT
+                ip[0], ip[1], ip[2], ip[3],
+                config::port()
             ));
         }
         Err(e) => {

@@ -13,7 +13,10 @@
 use crate::net;
 use crate::uart;
 
-const LISTEN_PORT: u16 = 8080;
+/// Control port — set at boot from MARKOS.CFG (installer-baked).
+fn listen_port() -> u16 {
+    crate::config::port()
+}
 
 const FLAG_FIN: u8 = 1;
 const FLAG_SYN: u8 = 2;
@@ -47,7 +50,7 @@ pub fn input(seg: &[u8], src_ip: [u8; 4], src_mac: [u8; 6]) {
     let doff = ((seg[12] >> 4) & 0xF) as usize * 4;
     let flags = seg[13];
     let payload_len = seg.len().saturating_sub(doff);
-    if dst_port != LISTEN_PORT || doff < 20 || doff > seg.len() {
+    if dst_port != listen_port() || doff < 20 || doff > seg.len() {
         return;
     }
     let payload = &seg[doff..];
@@ -162,7 +165,7 @@ fn tcp_send_seg(seq: u32, ack: u32, flags: u8, payload: &[u8]) {
     // TCP header (20 bytes) + payload, checksum computed over the
     // pseudo-header + segment with the checksum field zero.
     let mut seg = [0u8; 20 + 1460];
-    seg[0..2].copy_from_slice(&LISTEN_PORT.to_be_bytes());
+    seg[0..2].copy_from_slice(&listen_port().to_be_bytes());
     seg[2..4].copy_from_slice(&peer_port().to_be_bytes());
     seg[4..8].copy_from_slice(&seq.to_be_bytes());
     seg[8..12].copy_from_slice(&ack.to_be_bytes());
