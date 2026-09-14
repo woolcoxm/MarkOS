@@ -461,8 +461,8 @@ pub fn ip_send(dst_mac: &[u8; 6], dst_ip: &[u8; 4], proto: u8, payload: &[u8]) {
     ip[16..20].copy_from_slice(dst_ip);
     let csum = ip_checksum(&ip[..20]);
     ip[10..12].copy_from_slice(&csum);
-    out[ETH_HDR + 20..].copy_from_slice(payload);
-    net_send(&out);
+    out[ETH_HDR + 20..ETH_HDR + 20 + payload.len()].copy_from_slice(payload);
+    net_send(&out[..ETH_HDR + 20 + payload.len()]);
 }
 
 fn ip_checksum(data: &[u8]) -> [u8; 2] {
@@ -488,7 +488,13 @@ fn sum_ones_complement(data: &[u8]) -> u32 {
 }
 
 pub fn serve_loop() -> ! {
+    let mut beat: u64 = 0;
     loop {
         poll();
+        beat += 1;
+        if beat % 4_000_000 == 0 {
+            uart::write_str("net: alive
+");
+        }
     }
 }

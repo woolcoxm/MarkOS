@@ -386,6 +386,189 @@ fn selftest_net() -> ! {
     net::serve_loop()
 }
 
+/// Acceptance test (Pi-1): a `brk` is caught and execution resumes past it;
+/// a read of an unmapped virtual address takes a data abort that is caught
+/// and logged with the fault address (then parks — it is fatal by design).
+#[cfg(feature = "selftest-exceptions")]
+fn selftest_exceptions() -> ! {
+    uart::write_str("selftest: triggering brk\n");
+    // Soundness: `brk #0` is the deliberate fault; the brk handler advances
+    // ELR past the 4-byte instruction so this code resumes.
+    unsafe { core::arch::asm!("brk #0", options(nomem, nostack, preserves_flags)) };
+    uart::write_str("PASS: brk caught and execution resumed\n");
+
+    uart::write_str("selftest: triggering data abort (read of unmapped VA)\n");
+    // 4 TiB: canonical, beyond the [0,2GiB) identity map -> level-0
+    // translation fault.
+    let addr: u64 = 0x0000_0400_0000_0000;
+    // Soundness: the deliberate fault is the whole point; raw asm so the
+    // dereference address is exactly `addr`.
+    unsafe {
+        core::arch::asm!(
+            "ldr x1, [x0]",
+            in("x0") addr,
+            lateout("x1") _,
+            options(nostack)
+        );
+    }
+    uart::write_str("FAIL: data abort did not trigger\n");
+    park()
+}
+
+/// Acceptance test (Pi-3a): virtio-blk bring-up + first read (LBA0 MBR
+/// signature check) against the QEMU virtio-mmio device.
+#[cfg(feature = "selftest-block")]
+fn selftest_block() -> ! {
+    uart::write_str("selftest: virtio-blk bring-up + LBA0 read\n");
+    match virtio_blk::bring_up_and_verify() {
+        Ok(sectors) => {
+            uart::locked_write(format_args!(
+                "PASS: block device verified ({sectors} sectors)\n"
+            ));
+        }
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: block: {e}\n"));
+        }
+    }
+    park()
+}
+
+/// Acceptance test (Pi-3b/c): FAT32 mount over the block device, MODEL.BIN
+/// lookup in the root directory, full cluster-chain read, then a GGUF v3
+/// parse of the model file.
+#[cfg(feature = "selftest-fat")]
+fn selftest_fat() -> ! {
+    uart::write_str("selftest: FAT32 mount + file read\n");
+    if let Err(e) = virtio_blk::init() {
+        uart::locked_write(format_args!("FAIL: virtio init: {e}\n"));
+        crate::park()
+    }
+    static mut FAT_BUF: [u8; 65536] = [0u8; 65536];
+
+    match fat::mount() {
+        Ok(vol) => match vol.open_model() {
+            Ok(file) => {
+                let mut bytes = 0usize;
+                // Soundness: FAT_BUF is boot-stage scratch owned by this
+                // selftest; the device DMAs into it while nothing else runs.
+                unsafe {
+                    let buf = core::slice::from_raw_parts_mut(
+                        (&raw mut FAT_BUF) as *mut u8,
+                        65536,
+                    );
+                    match vol.read_file(&file, buf) {
+                        Ok(n) => {
+                            bytes = n;
+                        }
+                        Err(e) => {
+                            uart::locked_write(format_args!("FAIL: FAT read_file: {e}\n"));
+                            crate::park()
+                        }
+                    }
+                    // GGUF parse: the model file must be well-formed GGUF v3.
+                    match gguf::parse_and_dump(&buf[..file.size as usize]) {
+                        Ok(info) => {
+                            uart::locked_write(format_args!(
+                                "PASS: gguf parsed v{} tensors={}\n",
+                                info.version,
+                                info.tensor_count
+                            ));
+                        }
+                        Err(e) => {
+                            uart::locked_write(format_args!("FAIL: gguf: {e}\n"));
+                        }
+                    }
+                }
+                uart::locked_write(format_args!(
+                    "PASS: FAT32 file read, {bytes} bytes\n"
+                ));
+            }
+            Err(e) => {
+                uart::locked_write(format_args!("FAIL: FAT open: {e}\n"));
+            }
+        },
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: FAT mount: {e}\n"));
+        }
+    }
+    park()
+}
+
+/// Acceptance test (Pi-4): parallel sum over a 65536-element array across
+/// every core via the execution pool, matching the single-threaded
+/// reference exactly.
+#[cfg(feature = "selftest-pool")]
+#[repr(C)]
+struct PoolSumDesc {
+    data: *const u64,
+    len: usize,
+    partials: *mut u64,
+}
+
+#[cfg(feature = "selftest-pool")]
+fn selftest_pool() -> ! {
+    uart::write_str("selftest: parallel sum over 65536 elements\n");
+    static mut POOL_DATA: [u64; 65536] = [0; 65536];
+    static mut POOL_PARTIALS: [u64; 8] = [0; 8];
+
+    unsafe {
+        for i in 0..65536usize {
+            POOL_DATA[i] = (i % 251) as u64;
+        }
+    }
+
+    // Single-threaded reference.
+    let mut reference = 0u64;
+    // Soundness: POOL_DATA is exclusively owned by this selftest.
+    unsafe {
+        for i in 0..65536usize {
+            reference = reference.wrapping_add(POOL_DATA[i]);
+        }
+    }
+
+    // Parallel: split the array into per-core contiguous chunks.
+    let desc = PoolSumDesc {
+        data: &raw const POOL_DATA as *const u64,
+        len: 65536,
+        partials: &raw mut POOL_PARTIALS as *mut u64,
+    };
+    pool::run_on_all(pool_sum_job, &desc as *const PoolSumDesc as u64, board::CORE_COUNT);
+
+    let mut total = 0u64;
+    for p in 0..board::CORE_COUNT {
+        // Soundness: per-core slots, written before the pool barrier.
+        total = total.wrapping_add(unsafe { POOL_PARTIALS[p] });
+    }
+
+    if total == reference {
+        uart::locked_write(format_args!(
+            "pool: PASS sum={total} across {}/{} cores\n",
+            board::CORE_COUNT,
+            board::CORE_COUNT
+        ));
+    } else {
+        uart::locked_write(format_args!(
+            "FAIL: parallel sum {total} != reference {reference}\n"
+        ));
+    }
+    park()
+}
+
+#[cfg(feature = "selftest-pool")]
+fn pool_sum_job(core_id: usize, arg: u64) {
+    // Soundness: `arg` points at the PoolSumDesc published by the BSP for
+    // the duration of the job; chunks are disjoint per core.
+    let d = unsafe { &*(arg as *const PoolSumDesc) };
+    let chunk = d.len / board::CORE_COUNT;
+    let start = core_id * chunk;
+    let end = if core_id + 1 == board::CORE_COUNT { d.len } else { start + chunk };
+    let mut acc = 0u64;
+    for i in start..end {
+        acc = acc.wrapping_add(unsafe { d.data.add(i).read() });
+    }
+    unsafe { d.partials.add(core_id).write_volatile(acc) };
+}
+
 /// Panic path: print and park. Interrupts are masked at EL1.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

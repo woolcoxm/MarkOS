@@ -5,3 +5,6 @@ serial-*.log
 
 # Rust
 /target/
+
+# QEMU filter-dump captures
+*.pcap
