@@ -114,7 +114,7 @@ $(FAT_TEST_IMG):
 	echo "2048,30720,0x0c" | sfdisk $@ >/dev/null
 	dd if=/dev/zero of=tests/fatpart.img bs=512 count=30720 status=none
 	mkfs.vfat -F32 tests/fatpart.img >/dev/null
-	python3 -c "import sys; sys.stdout.buffer.write(bytes(i % 251 for i in range(65536)))" > tests/MODEL.BIN
+	python3 scripts/make_gguf_test.py tests/MODEL.BIN
 	mcopy -i tests/fatpart.img tests/MODEL.BIN ::/MODEL.BIN
 	dd if=tests/fatpart.img of=$@ bs=512 seek=2048 conv=notrunc status=none
 

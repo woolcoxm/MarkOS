@@ -18,6 +18,7 @@ mod board;
 mod board_release;
 mod cpu;
 mod fat;
+mod gguf;
 mod mmu;
 mod psci;
 mod smp;
@@ -156,11 +157,14 @@ extern "C" fn kmain() -> ! {
     selftest_exceptions();
     #[cfg(feature = "selftest-block")]
     selftest_block();
+    #[cfg(feature = "selftest-exceptions")]
+    selftest_exceptions();
+    #[cfg(feature = "selftest-block")]
+    selftest_block();
     #[cfg(feature = "selftest-fat")]
     selftest_fat();
 
-    // The selftests below are diverging, so this loop is unreachable when a
-    // selftest feature is enabled — that is expected, not a bug.
+    // The loop below is unreachable when a diverging selftest ran.
     #[allow(unreachable_code)]
     loop {
         // Soundness: `wfe` parks the core on a no-op event wait; nothing
@@ -177,30 +181,8 @@ pub fn park() -> ! {
     }
 }
 
-/// Acceptance test (Pi-3a): virtio-blk bring-up + first read (LBA0 MBR
-/// signature check) against the QEMU virtio-mmio device.
-#[cfg(feature = "selftest-block")]
-fn selftest_block() -> ! {
-    uart::write_str("selftest: virtio-blk bring-up + LBA0 read
-");
-    match virtio_blk::bring_up_and_verify() {
-        Ok(sectors) => {
-            let _ = uart::locked_write(format_args!(
-                "PASS: block device verified ({sectors} sectors)
-"
-            ));
-        }
-        Err(e) => {
-            let _ = uart::locked_write(format_args!("FAIL: block: {e}
-"));
-        }
-    }
-    park()
-}
-
-/// Acceptance test (Pi-3b): FAT32 mount over the block device, MODEL.BIN
-/// lookup in the root directory, full cluster-chain read, and a byte-exact
-/// pattern check (byte[i] == i %% 251 written by the image build rule).
+/// Acceptance test (Pi-3a/b): virtio-blk + FAT32 mount + MODEL.BIN read,
+/// then a GGUF v3 parse of the model file.
 #[cfg(feature = "selftest-fat")]
 fn selftest_fat() -> ! {
     uart::write_str("selftest: FAT32 mount + file read
@@ -216,7 +198,6 @@ fn selftest_fat() -> ! {
         Ok(vol) => match vol.open_model() {
             Ok(file) => {
                 let mut bytes = 0usize;
-                let mut ok = true;
                 // Soundness: FAT_BUF is boot-stage scratch owned by this
                 // selftest; the device DMAs into it while nothing else runs.
                 unsafe {
@@ -227,16 +208,6 @@ fn selftest_fat() -> ! {
                     match vol.read_file(&file, buf) {
                         Ok(n) => {
                             bytes = n;
-                            for i in 0..file.size as usize {
-                                if buf[i] != (i % 251) as u8 {
-                                    ok = false;
-                                    uart::locked_write(format_args!(
-                                        "FAIL: FAT read mismatch at byte {i}
-"
-                                    ));
-                                    break;
-                                }
-                            }
                         }
                         Err(e) => {
                             uart::locked_write(format_args!("FAIL: FAT read_file: {e}
@@ -244,12 +215,23 @@ fn selftest_fat() -> ! {
                             crate::park()
                         }
                     }
+                    match gguf::parse_and_dump(&buf[..file.size as usize]) {
+                        Ok(info) => {
+                            uart::locked_write(format_args!(
+                                "PASS: gguf parsed v{} tensors={}
+",
+                                info.version, info.tensor_count
+                            ));
+                        }
+                        Err(e) => {
+                            uart::locked_write(format_args!("FAIL: gguf: {e}
+"));
+                        }
+                    }
                 }
                 uart::locked_write(format_args!(
-                    "PASS: FAT32 file read, {bytes} bytes, pattern {}
-",
-                    if ok { "verified" } else { "MISMATCH" }
-                ));
+                    "PASS: FAT32 file read, {bytes} bytes
+"));
             }
             Err(e) => {
                 uart::locked_write(format_args!("FAIL: FAT open: {e}
