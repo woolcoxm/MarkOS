@@ -21,6 +21,11 @@ const ATTR_LFN: u8 = 0x0F;
 const ATTR_DIR: u8 = 0x10;
 const EOC_MIN: u32 = 0x0FFF_FFF8;
 
+/// Scratch for partial-cluster reads in `read_at` (max FAT32 cluster is
+/// 32 MiB in theory; 32 KiB covers every mkfs.vfat default).
+static mut CLUSTER_SCRATCH: [u8; 32 * 1024] = [0u8; 32 * 1024];
+const CLUSTER_SCRATCH_LEN: usize = 32 * 1024;
+
 pub struct FatVolume {
     part_lba: u64,
     sectors_per_cluster: u32,
@@ -204,6 +209,51 @@ impl FatVolume {
                 0 => None,
                 next => Some(next),
             };
+        }
+        Ok(written)
+    }
+
+    /// Random-access read: `buf.len()` bytes at byte `offset` inside the
+    /// file (short read at EOF). Walks the cluster chain to reach the
+    /// offset, so GB-scale files can be sampled without loading them.
+    pub fn read_at(&self, file: &File, offset: u64, buf: &mut [u8]) -> Result<usize, &'static str> {
+        let csize = self.sectors_per_cluster as usize * SECTOR;
+        if csize > CLUSTER_SCRATCH_LEN {
+            return Err("cluster larger than scratch");
+        }
+        let mut cluster = file.first_cluster;
+        // Skip the whole clusters that lie entirely before `offset`.
+        let skip = (offset / csize as u64) as u32;
+        for _ in 0..skip {
+            cluster = self.fat_entry(cluster)?;
+            if cluster == 0 || cluster >= EOC_MIN {
+                return Err("offset past end of file");
+            }
+        }
+        // Soundness: CLUSTER_SCRATCH is boot/selftest-stage scratch on the
+        // BSP; the device DMAs into it while nothing else runs.
+        let scratch = unsafe {
+            core::slice::from_raw_parts_mut(
+                (&raw mut CLUSTER_SCRATCH) as *mut u8,
+                CLUSTER_SCRATCH_LEN,
+            )
+        };
+        let mut pos_in_cluster = (offset % csize as u64) as usize;
+        let mut written = 0usize;
+        while written < buf.len() {
+            self.read_cluster(cluster, &mut scratch[..csize])?;
+            let avail = &scratch[pos_in_cluster..csize];
+            let n = avail.len().min(buf.len() - written);
+            buf[written..written + n].copy_from_slice(&avail[..n]);
+            written += n;
+            pos_in_cluster = 0;
+            if written >= buf.len() {
+                break;
+            }
+            cluster = self.fat_entry(cluster)?;
+            if cluster == 0 || cluster >= EOC_MIN {
+                break; // EOF: short read
+            }
         }
         Ok(written)
     }

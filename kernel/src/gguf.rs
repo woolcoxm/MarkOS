@@ -121,8 +121,9 @@ pub struct GgufInfo {
 }
 
 /// Collected tensor table (filled by parse_and_dump, no heap).
-pub const MAX_TENSORS: usize = 8;
-pub const MAX_NAME: usize = 32;
+/// 512 entries covers every small-model GGUF (Qwen3-0.6B ≈ 200-300).
+pub const MAX_TENSORS: usize = 512;
+pub const MAX_NAME: usize = 48;
 
 static mut T_NAMES: [[u8; MAX_NAME]; MAX_TENSORS] = [[0; MAX_NAME]; MAX_TENSORS];
 static mut T_NAME_LEN: [usize; MAX_TENSORS] = [0; MAX_TENSORS];
@@ -130,6 +131,53 @@ static mut T_DIMS: [[u64; 4]; MAX_TENSORS] = [[0; 4]; MAX_TENSORS];
 static mut T_TYPE: [u32; MAX_TENSORS] = [0; MAX_TENSORS];
 static mut T_OFFSET: [u64; MAX_TENSORS] = [0; MAX_TENSORS];
 static mut T_COUNT: usize = 0;
+
+/// Snapshot row: one tensor's identity, copied out of the statics.
+#[derive(Clone, Copy)]
+pub struct TensorEntry {
+    pub name: [u8; MAX_NAME],
+    pub name_len: usize,
+    pub dims: [u64; 4],
+    pub ttype: u32,
+    pub offset: u64,
+}
+
+impl TensorEntry {
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_len]
+    }
+}
+
+/// Copy the parsed table into `out`; returns the number of entries.
+pub fn snapshot(out: &mut [TensorEntry]) -> usize {
+    let n = unsafe { T_COUNT }.min(out.len());
+    // Soundness: table is filled once during single-core boot, read-only after.
+    for i in 0..n {
+        unsafe {
+            out[i] = TensorEntry {
+                name: T_NAMES[i],
+                name_len: T_NAME_LEN[i],
+                dims: T_DIMS[i],
+                ttype: T_TYPE[i],
+                offset: T_OFFSET[i],
+            };
+        }
+    }
+    n
+}
+
+/// IEEE CRC-32 (matches zlib.crc32), table-free bit loop.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
 
 /// Look up a tensor by name (exact byte match).
 pub fn find_tensor(name: &[u8]) -> Option<(&'static [u8], &'static [u64; 4], u32, u64)> {

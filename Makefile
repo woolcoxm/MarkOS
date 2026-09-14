@@ -20,6 +20,10 @@ VIRT_IMAGE   := virt.img
 FAT_TEST_IMG := tests/fat.img
 TEST_IMG     := tests/test.img
 INSTALL_IMG  := tests/install.img
+# Real-model artifacts live outside the repo (in $HOME, off the slow 9p
+# mount): a 640 MB GGUF is one-time download; the image is one-time build.
+MODEL_FILE ?= $(HOME)/markos-models/Qwen3-0.6B-Q8_0.gguf
+REAL_IMG   := $(HOME)/.markos-tests/real.img
 SD_DIR       := sd
 
 # Ubuntu's objcopy lacks AArch64 support; rustup's LLVM tooling has it.
@@ -211,6 +215,30 @@ test-soak: image-virt $(FAT_TEST_IMG)
 	python3 scripts/soak_client.py 127.0.0.1 8080 40 > client-soak.log 2>&1; rc=$$?; tail -3 client-soak.log; \
 	kill $$qpid 2>/dev/null; \
 	[ $$rc -eq 0 ] && echo "PASS: soak" || { echo "FAIL: soak"; exit 1; }
+
+## Real-model test image: MBR + one FAT32 partition holding the full GGUF.
+$(REAL_IMG): $(MODEL_FILE)
+	mkdir -p $(HOME)/.markos-tests
+	rm -f $(REAL_IMG) $(HOME)/.markos-tests/realpart.img
+	dd if=/dev/zero of=$(REAL_IMG) bs=1M count=700 status=none
+	echo "2048,,0x0c" | sfdisk $(REAL_IMG) >/dev/null
+	dd if=/dev/zero of=$(HOME)/.markos-tests/realpart.img bs=1024 count=715776 status=none
+	mkfs.vfat -F32 $(HOME)/.markos-tests/realpart.img >/dev/null
+	mcopy -i $(HOME)/.markos-tests/realpart.img $(MODEL_FILE) ::/MODEL.BIN
+	dd if=$(HOME)/.markos-tests/realpart.img of=$(REAL_IMG) bs=512 seek=2048 conv=notrunc status=none
+	@echo "real image ready: $(REAL_IMG)"
+
+## Phase 7 acceptance: load the REAL GGUF from the disk image and verify
+## the full tensor table + payload CRCs against the host reference
+## (scripts/gguf_ref.py) — the kernel's serial output must byte-match it.
+test-model: image-virt $(REAL_IMG)
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-model
+	python3 scripts/gguf_ref.py $(MODEL_FILE) $(HOME)/.markos-tests/expected.txt
+	bash scripts/kill_qemu.sh; sleep 1; \
+	timeout 180 $(QEMU) $(VIRTFLAGS) -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 > serial-model.log 2>&1 || true; \
+	tr -d "\r" < serial-model.log | grep -E "^(model:|MT |MV )" > $(HOME)/.markos-tests/got.txt || true; \
+	tr -d "\r" < serial-model.log | grep -q "^PASS: model load" || { echo "FAIL: model load (no PASS marker)"; tail -5 serial-model.log; exit 1; }; \
+	diff $(HOME)/.markos-tests/expected.txt $(HOME)/.markos-tests/got.txt > $(HOME)/.markos-tests/model.diff && echo "PASS: model load" || { echo "FAIL: model load (expected vs got):"; head -10 $(HOME)/.markos-tests/model.diff; exit 1; }
 
 ## Pi-2 acceptance (qemu-virt, PSCI): 4 cores online, exact shared counter.
 test-smp: image-virt

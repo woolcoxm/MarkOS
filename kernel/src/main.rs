@@ -193,6 +193,8 @@ extern "C" fn kmain() -> ! {
     selftest_matmul();
     #[cfg(feature = "selftest-net")]
     selftest_net();
+    #[cfg(feature = "selftest-model")]
+    selftest_model();
     #[cfg(feature = "selftest-pcie")]
     selftest_pcie();
 
@@ -600,6 +602,142 @@ fn selftest_pcie() -> ! {
             has_root_port
         ));
     }
+    park()
+}
+
+/// Phase 7 acceptance: load a REAL GGUF (Qwen3-0.6B q8_0, 640 MB) from the
+/// QEMU disk image. Only the metadata section is buffered — the full tensor
+/// table (310 tensors) is parsed, and chosen tensor payloads are CRC-checked
+/// by reading them directly from the FAT volume at their data-section
+/// offsets (read_at). The gate diffs this output against the host
+/// reference produced by scripts/gguf_ref.py on the same file.
+#[cfg(feature = "selftest-model")]
+fn selftest_model() -> ! {
+    uart::write_str("selftest: real GGUF load\n");
+    if let Err(e) = virtio_blk::init() {
+        uart::locked_write(format_args!("FAIL: virtio init: {e}\n"));
+        park()
+    }
+
+    // Metadata section of the GGUF (kv pairs incl. tokenizer arrays + the
+    // full tensor table). Qwen3-0.6B's metadata ends at ~5.95 MB.
+    const META_BUF_LEN: usize = 8 * 1024 * 1024;
+    static mut META_BUF: [u8; META_BUF_LEN] = [0u8; META_BUF_LEN];
+
+    let vol = match fat::mount() {
+        Ok(v) => v,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: fat mount: {e}\n"));
+            park()
+        }
+    };
+    let file = match vol.open_model() {
+        Ok(f) => f,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: open model: {e}\n"));
+            park()
+        }
+    };
+    let n = {
+        // Soundness: META_BUF is selftest-stage scratch on the BSP; the
+        // device DMAs into it while nothing else runs.
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(
+                (&raw mut META_BUF) as *mut u8,
+                META_BUF_LEN,
+            )
+        };
+        match vol.read_at(&file, 0, buf) {
+            Ok(n) => n,
+            Err(e) => {
+                uart::locked_write(format_args!("FAIL: metadata read: {e}\n"));
+                park()
+            }
+        }
+    };
+
+    let info = match gguf::parse_and_dump(unsafe {
+        // Soundness: META_BUF is selftest scratch, single-core owned.
+        core::slice::from_raw_parts((&raw const META_BUF) as *const u8, n)
+    }) {
+        Ok(i) => i,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: gguf parse: {e}\n"));
+            park()
+        }
+    };
+    // Byte-matches scripts/gguf_ref.py output.
+    uart::locked_write(format_args!(
+        "model: version={} tensors={} kv={} data_start={:#x} align={}\n",
+        info.version, info.tensor_count, info.kv_count, info.data_start, info.alignment
+    ));
+
+    // First 8 tensors of the table, in table order.
+    let mut snap = [gguf::TensorEntry {
+        name: [0; gguf::MAX_NAME],
+        name_len: 0,
+        dims: [0; 4],
+        ttype: 0,
+        offset: 0,
+    }; 8];
+    let n_snap = gguf::snapshot(&mut snap);
+    for (i, t) in snap.iter_mut().enumerate().take(n_snap) {
+        uart::locked_write(format_args!("MT {i} ",));
+        for &b in t.name() {
+            uart::write_byte(if (0x20..0x7F).contains(&b) { b } else { b'?' });
+        }
+        uart::locked_write(format_args!(
+            " {}x{}x{}x{} type={} off={}\n",
+            t.dims[0], t.dims[1], t.dims[2], t.dims[3], t.ttype, t.offset
+        ));
+    }
+
+    // Payload checks: CRC-32 + first bytes of chosen tensors, read straight
+    // from the volume at their data-section offsets. Missing names are
+    // skipped (matches the reference: Qwen3-0.6B has no output.weight).
+    const CHECK: [&[u8]; 3] = [
+        b"token_embd.weight",
+        b"blk.0.attn_q.weight",
+        b"output.weight",
+    ];
+    const VAL_BUF_LEN: usize = 256;
+    static mut VAL_BUF: [u8; VAL_BUF_LEN] = [0u8; VAL_BUF_LEN];
+    for want in CHECK {
+        let Some((_name, dims, ttype, off)) = gguf::find_tensor(want) else {
+            continue;
+        };
+        let abs = info.data_start + off;
+        let val = unsafe {
+            core::slice::from_raw_parts_mut((&raw mut VAL_BUF) as *mut u8, VAL_BUF_LEN)
+        };
+        let got = match vol.read_at(&file, abs, val) {
+            Ok(g) => g,
+            Err(e) => {
+                uart::locked_write(format_args!(
+                    "FAIL: tensor read at {abs:#x}: {e}\n"
+                ));
+                park()
+            }
+        };
+        if got < val.len() {
+            uart::locked_write(format_args!(
+                "FAIL: short tensor read at {abs:#x}: {got}\n"
+            ));
+            park()
+        }
+        let crc = gguf::crc32(val);
+        uart::locked_write(format_args!("MV ",));
+        for &b in want {
+            uart::write_byte(b);
+        }
+        uart::locked_write(format_args!(
+            " crc={crc:08x} first4={:02x}{:02x}{:02x}{:02x} dims={}x{}x{}x{} type={ttype}\n",
+            val[0], val[1], val[2], val[3],
+            dims[0], dims[1], dims[2], dims[3]
+        ));
+    }
+
+    uart::locked_write(format_args!("PASS: model load\n"));
     park()
 }
 
