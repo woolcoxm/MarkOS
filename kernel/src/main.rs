@@ -23,6 +23,7 @@ mod smp;
 mod timer;
 mod uart;
 mod vectors;
+mod virtio_blk;
 
 use core::{arch::global_asm, panic::PanicInfo};
 
@@ -152,6 +153,8 @@ extern "C" fn kmain() -> ! {
 
     #[cfg(feature = "selftest-exceptions")]
     selftest_exceptions();
+    #[cfg(feature = "selftest-block")]
+    selftest_block();
 
     // The selftests below are diverging, so this loop is unreachable when a
     // selftest feature is enabled — that is expected, not a bug.
@@ -169,6 +172,27 @@ pub fn park() -> ! {
         // Soundness: terminal wait; the core never resumes by design.
         unsafe { core::arch::asm!("wfe", options(nomem, nostack, preserves_flags)) }
     }
+}
+
+/// Acceptance test (Pi-3a): virtio-blk bring-up + first read (LBA0 MBR
+/// signature check) against the QEMU virtio-mmio device.
+#[cfg(feature = "selftest-block")]
+fn selftest_block() -> ! {
+    uart::write_str("selftest: virtio-blk bring-up + LBA0 read
+");
+    match virtio_blk::bring_up_and_verify() {
+        Ok(sectors) => {
+            let _ = uart::locked_write(format_args!(
+                "PASS: block device verified ({sectors} sectors)
+"
+            ));
+        }
+        Err(e) => {
+            let _ = uart::locked_write(format_args!("FAIL: block: {e}
+"));
+        }
+    }
+    park()
 }
 
 /// Acceptance test (Pi-1): a `brk` is caught and execution resumes past it;
