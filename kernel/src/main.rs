@@ -20,9 +20,11 @@ mod fat;
 mod gguf;
 mod matmul;
 mod mmu;
+mod net;
 mod pool;
 mod psci;
 mod smp;
+mod tcp;
 mod timer;
 mod uart;
 mod vectors;
@@ -186,6 +188,8 @@ extern "C" fn kmain() -> ! {
     selftest_pool();
     #[cfg(feature = "selftest-matmul")]
     selftest_matmul();
+    #[cfg(feature = "selftest-net")]
+    selftest_net();
 
     // The loop below is unreachable when a diverging selftest ran.
     #[allow(unreachable_code)]
@@ -354,6 +358,33 @@ fn selftest_matmul() -> ! {
     park()
 }
 
+
+/// Appliance network service (Pi-5): bring up virtio-net and run the
+/// poll/serve loop forever — TCP 8080 answers MARKOS-PING with
+/// MARKOS-PONG for the transport acceptance gate.
+#[cfg(feature = "selftest-net")]
+fn selftest_net() -> ! {
+    match net::init() {
+        Ok(()) => {
+            let mut mac = [0u8; 18];
+            let m = net::mac_string(&mut mac);
+            uart::locked_write(format_args!(
+                "net: virtio-net up mac={:?} ip=10.0.2.15:{}
+",
+                core::str::from_utf8(&mac[..m]).unwrap_or("?"),
+                net::LISTEN_PORT
+            ));
+        }
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: net init: {e}
+"));
+            crate::park()
+        }
+    }
+    uart::write_str("net: serving
+");
+    net::serve_loop()
+}
 
 /// Panic path: print and park. Interrupts are masked at EL1.
 #[panic_handler]

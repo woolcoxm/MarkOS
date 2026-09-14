@@ -141,6 +141,15 @@ test-matmul: image-virt $(FAT_TEST_IMG)
 	@echo "--- serial-mm.log ---"; cat serial-mm.log
 	@grep -q "PASS: matmul" serial-mm.log 		&& echo "PASS: matmul acceptance" 		|| { echo "FAIL: matmul acceptance"; exit 1; }
 
+## Pi-5 acceptance (qemu-virt): TCP MARKOS-PING -> MARKOS-PONG end to end.
+test-net: image-virt $(FAT_TEST_IMG)
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-net
+	(timeout 25 $(QEMU) -M virt -cpu cortex-a53 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -kernel $(VIRT_IMAGE) -drive file=$(FAT_TEST_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-net.log 2>&1 &)
+	sleep 4
+	python3 scripts/net_client.py 127.0.0.1 8080 || true
+	sleep 2
+	@grep -aq "net: PASS" serial-net.log 		&& echo "PASS: network ping/pong" 		|| { echo "FAIL: network ping/pong"; exit 1; }
+
 ## Pi-2 acceptance (qemu-virt, PSCI): 4 cores online, exact shared counter.
 test-smp: image-virt
 	timeout --preserve-status $(TIMEOUT) $(QEMU) $(VIRTFLAGS) \
@@ -153,7 +162,7 @@ test-smp: image-virt
 clean:
 	cargo clean || true
 	rm -f $(IMAGE) $(PI5_IMAGE) $(VIRT_IMAGE) serial.log serial-exc.log serial-smp.log serial-blk.log
-	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log
+	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log serial-net.log client.log
 
 distclean: clean
 	rm -rf $(HOME)/.markos-target
