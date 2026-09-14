@@ -99,6 +99,18 @@ test-pf:
 ## Full Phase 1 acceptance: both deliberate faults, two boots.
 test-phase1: test-div test-pf
 
+## Phase 2 acceptance: 10,240 alloc/dealloc frame pairs, leak check.
+test-frames:
+	$(MAKE) iso KERNEL_FEATURES=selftest-frames
+	timeout --preserve-status $(TIMEOUT) $(QEMU) $(QEMUFLAGS) -cdrom $(IMAGE) -boot d \
+		-serial stdio > serial-frames.log 2>&1 || true
+	@echo "--- serial-frames.log ---"; cat serial-frames.log
+	@grep -q "PASS: frame stress" serial-frames.log \
+		&& echo "PASS: frame allocator stress test" \
+		|| { echo "FAIL: frame allocator stress test"; exit 1; }
+
+test-phase2: test-frames
+
 clean:
 	cargo clean || true
 	rm -f $(IMAGE) serial.log

@@ -17,14 +17,16 @@
 
 mod gdt;
 mod interrupts;
+mod mem;
+mod physmem;
 mod regs;
 mod serial;
 
 use core::{arch::asm, arch::global_asm, panic::PanicInfo};
 
 use limine::{
+    request::{EntryPointRequest, HhdmRequest, MemmapRequest},
     BaseRevision, RequestsEndMarker, RequestsStartMarker,
-    request::EntryPointRequest,
 };
 
 // Limine leaves x87/SSE disabled at kernel entry (CR0.EM set), but the
@@ -72,6 +74,15 @@ static BASE_REVISION: BaseRevision = BaseRevision::new();
 #[unsafe(link_section = ".limine_requests")]
 static ENTRY_POINT: EntryPointRequest = EntryPointRequest::new(kernel_entry);
 
+// Boot-time information the kernel builds on: the physical memory map and
+// the base of the higher-half direct map (phys + offset = virt).
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static MEMMAP: MemmapRequest = MemmapRequest::new();
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static HHDM: HhdmRequest = HhdmRequest::new();
+
 #[used]
 #[unsafe(link_section = ".limine_requests_end")]
 static _REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
@@ -94,12 +105,21 @@ unsafe extern "C" fn kernel_main() -> ! {
     interrupts::init();
     serial::write_str("idt: all CPU exception vectors handled\n");
 
+    physmem::dump_memory_map();
+    let (managed_mib, free) = physmem::init();
+    let _ = core::fmt::write(
+        &mut serial::Serial,
+        format_args!("physmem: managing largest usable region ({managed_mib} MiB), {free} free frames\n"),
+    );
+
     serial::write_str("cpu bring-up complete\n");
 
     #[cfg(feature = "selftest-div")]
     selftest_divide();
     #[cfg(feature = "selftest-pf")]
     selftest_page_fault();
+    #[cfg(feature = "selftest-frames")]
+    selftest_frames();
 
     // The selftests above are diverging, so this loop is unreachable when a
     // selftest feature is enabled — that is expected, not a bug.
@@ -163,6 +183,65 @@ fn selftest_page_fault() -> ! {
         );
     }
     unreachable!("bad read did not fault");
+}
+
+/// Acceptance test (Phase 2): allocate/free thousands of frames in a stress
+/// loop; the free-frame count must return to its starting value every round
+/// (no leaks) and no allocation may fail while frames remain.
+#[cfg(feature = "selftest-frames")]
+fn selftest_frames() -> ! {
+    use x86_64::structures::paging::{PhysFrame, Size4KiB};
+
+    serial::write_str("selftest: frame stress (10,240 alloc/dealloc pairs)\n");
+    const BATCH: usize = 256;
+    const ROUNDS: usize = 40;
+
+    let before = physmem::free_frames();
+    let mut slots: [Option<PhysFrame<Size4KiB>>; BATCH] = [None; BATCH];
+
+    for round in 0..ROUNDS {
+        for slot in slots.iter_mut() {
+            *slot = physmem::alloc_frame();
+        }
+        if slots.iter().any(|s| s.is_none()) {
+            serial::write_str("FAIL: frame alloc returned None mid-test\n");
+            halt_loop();
+        }
+        if physmem::free_frames() != before - BATCH {
+            serial::write_str("FAIL: free count wrong after batch alloc\n");
+            halt_loop();
+        }
+        for slot in slots.iter_mut() {
+            let f = slot.take().expect("slot held a frame");
+            if let Err(e) = physmem::dealloc_frame(f) {
+                let _ = core::fmt::write(
+                    &mut serial::Serial,
+                    format_args!("FAIL: dealloc rejected a live frame: {e}\n"),
+                );
+                halt_loop();
+            }
+        }
+        if physmem::free_frames() != before {
+            let _ = core::fmt::write(
+                &mut serial::Serial,
+                format_args!(
+                    "FAIL: leak — free {} != {} after round {round}\n",
+                    physmem::free_frames(),
+                    before
+                ),
+            );
+            halt_loop();
+        }
+    }
+
+    let _ = core::fmt::write(
+        &mut serial::Serial,
+        format_args!(
+            "PASS: frame stress — {n} alloc/dealloc pairs, free count stable at {before}\n",
+            n = BATCH * ROUNDS
+        ),
+    );
+    halt_loop()
 }
 
 /// Panic path: print the panic message, a register snapshot, and halt.
