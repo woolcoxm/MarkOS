@@ -125,6 +125,13 @@ test-fat: image-virt $(FAT_TEST_IMG)
 	@echo "--- serial-fat.log ---"; cat serial-fat.log
 	@grep -q "PASS: FAT32 file read" serial-fat.log 		&& echo "PASS: FAT32 acceptance" 		|| { echo "FAIL: FAT32 acceptance"; exit 1; }
 
+## Pi-4 acceptance (qemu-virt): parallel sum across all cores via the pool.
+test-pool: image-virt
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-pool
+	timeout --preserve-status $(TIMEOUT) $(QEMU) $(VIRTFLAGS) -kernel $(VIRT_IMAGE) > serial-pool.log 2>&1 || true
+	@echo "--- serial-pool.log ---"; cat serial-pool.log
+	@grep -q "pool: PASS" serial-pool.log 		&& echo "PASS: execution pool" 		|| { echo "FAIL: execution pool"; exit 1; }
+
 ## Pi-2 acceptance (qemu-virt, PSCI): 4 cores online, exact shared counter.
 test-smp: image-virt
 	timeout --preserve-status $(TIMEOUT) $(QEMU) $(VIRTFLAGS) \
@@ -137,7 +144,7 @@ test-smp: image-virt
 clean:
 	cargo clean || true
 	rm -f $(IMAGE) $(PI5_IMAGE) $(VIRT_IMAGE) serial.log serial-exc.log serial-smp.log serial-blk.log
-	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN
+	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log
 
 distclean: clean
 	rm -rf $(HOME)/.markos-target

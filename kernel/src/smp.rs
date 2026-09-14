@@ -46,6 +46,12 @@ static CORE_RELEASE: [AtomicU64; 4] = [
 global_asm!(
     ".globl secondary_entry",
     "secondary_entry:",
+    // PSCI resets cores with FP/NEON disabled (CPACR_EL1.FPEN=0); any NEON
+    // instruction emitted by Rust code would undef-fault the AP into the
+    // zero vector. Enable FP/NEON first thing.
+    "    mov x2, #(3 << 20)",
+    "    msr cpacr_el1, x2",
+    "    isb",
     // Entered with MMU off, no stack, x0 = context (ignored: core id is
     // re-read from MPIDR so every release path works).
     "    mrs x0, mpidr_el1",
@@ -83,7 +89,8 @@ extern "C" fn secondary_main(core_id: u64) -> ! {
     // Report online LAST: the BSP treats ONLINE as "this core is completely
     // done", so its follow-up output cannot race the AP's log line.
     AP_ONLINE.fetch_add(1, Ordering::SeqCst);
-    crate::park()
+    // Enter the execution pool: this core now runs published jobs forever.
+    crate::pool::ap_pool_loop(core_id as usize)
 }
 
 fn ap_stack_top(core: usize) -> u64 {

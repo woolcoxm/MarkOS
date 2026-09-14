@@ -1,11 +1,9 @@
 //! MarkOS — a bare-metal Raspberry Pi unikernel that boots straight into an
 //! LLM inference engine.
 //!
-//! Pi-2 (this commit): SMP — every core the firmware starts (or PSCI
-//! releases) is brought online through `secondary_main`, contributing to an
-//! exact shared-counter acceptance test. Release paths: ARM64 spin-table
-//! (Pi firmware/QEMU raspi), PSCI CPU_ON (QEMU virt), legacy CORE_RELEASE
-//! (cores that entered our own stub).
+//! Pi-4 (this commit): the execution model — a fixed thread-per-core
+//! execution pool (no scheduler, cores spin between jobs) plus acceptance
+//! tests for every subsystem so far.
 //!
 //! owns: the kernel entry point and the boot stack.
 //! invariants: non-BSP cores park in the stub (or firmware parking) until
@@ -20,6 +18,7 @@ mod cpu;
 mod fat;
 mod gguf;
 mod mmu;
+mod pool;
 mod psci;
 mod smp;
 mod timer;
@@ -122,8 +121,11 @@ fn current_el() -> u8 {
 extern "C" fn kmain() -> ! {
     uart::init();
     uart::write_str("kernel alive\n");
-    uart::locked_write(format_args!("boot: board={} running at EL{}\n", board::NAME, current_el()),
-    );
+    uart::locked_write(format_args!(
+        "boot: board={} running at EL{}\n",
+        board::NAME,
+        current_el()
+    ));
 
     vectors::init();
     uart::write_str("vectors: VBAR_EL1 installed, DAIF masked\n");
@@ -144,9 +146,9 @@ extern "C" fn kmain() -> ! {
             let aps_expected = board::CORE_COUNT - 1;
             let ok = aps as usize == aps_expected && work == work_expected;
             uart::locked_write(format_args!(
-                    "smp: {aps}/{aps_expected} APs online, shared counter {work}/{work_expected} — {}\n",
-                    if ok { "PASS" } else { "FAIL" }
-                ));
+                "smp: {aps}/{aps_expected} APs online, shared counter {work}/{work_expected} — {}\n",
+                if ok { "PASS" } else { "FAIL" }
+            ));
         }
         Err(e) => {
             uart::locked_write(format_args!("smp: {e}\n"));
@@ -157,12 +159,10 @@ extern "C" fn kmain() -> ! {
     selftest_exceptions();
     #[cfg(feature = "selftest-block")]
     selftest_block();
-    #[cfg(feature = "selftest-exceptions")]
-    selftest_exceptions();
-    #[cfg(feature = "selftest-block")]
-    selftest_block();
     #[cfg(feature = "selftest-fat")]
     selftest_fat();
+    #[cfg(feature = "selftest-pool")]
+    selftest_pool();
 
     // The loop below is unreachable when a diverging selftest ran.
     #[allow(unreachable_code)]
@@ -181,15 +181,61 @@ pub fn park() -> ! {
     }
 }
 
-/// Acceptance test (Pi-3a/b): virtio-blk + FAT32 mount + MODEL.BIN read,
-/// then a GGUF v3 parse of the model file.
+/// Acceptance test (Pi-1): a `brk` is caught and execution resumes past it;
+/// a read of an unmapped virtual address takes a data abort that is caught
+/// and logged with the fault address (then parks — it is fatal by design).
+#[cfg(feature = "selftest-exceptions")]
+fn selftest_exceptions() -> ! {
+    uart::write_str("selftest: triggering brk\n");
+    // Soundness: `brk #0` is the deliberate fault; the brk handler advances
+    // ELR past the 4-byte instruction so this code resumes.
+    unsafe { core::arch::asm!("brk #0", options(nomem, nostack, preserves_flags)) };
+    uart::write_str("PASS: brk caught and execution resumed\n");
+
+    uart::write_str("selftest: triggering data abort (read of unmapped VA)\n");
+    // 4 TiB: canonical, beyond the [0,2GiB) identity map -> level-0
+    // translation fault.
+    let addr: u64 = 0x0000_0400_0000_0000;
+    // Soundness: the deliberate fault is the whole point; raw asm so the
+    // dereference address is exactly `addr`.
+    unsafe {
+        core::arch::asm!(
+            "ldr x1, [x0]",
+            in("x0") addr,
+            lateout("x1") _,
+            options(nostack)
+        );
+    }
+    uart::write_str("FAIL: data abort did not trigger\n");
+    park()
+}
+
+/// Acceptance test (Pi-3a): virtio-blk bring-up + first read (LBA0 MBR
+/// signature check) against the QEMU virtio-mmio device.
+#[cfg(feature = "selftest-block")]
+fn selftest_block() -> ! {
+    uart::write_str("selftest: virtio-blk bring-up + LBA0 read\n");
+    match virtio_blk::bring_up_and_verify() {
+        Ok(sectors) => {
+            uart::locked_write(format_args!(
+                "PASS: block device verified ({sectors} sectors)\n"
+            ));
+        }
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: block: {e}\n"));
+        }
+    }
+    park()
+}
+
+/// Acceptance test (Pi-3b/c): FAT32 mount over the block device, MODEL.BIN
+/// lookup in the root directory, full cluster-chain read, then a GGUF v3
+/// parse of the model file.
 #[cfg(feature = "selftest-fat")]
 fn selftest_fat() -> ! {
-    uart::write_str("selftest: FAT32 mount + file read
-");
+    uart::write_str("selftest: FAT32 mount + file read\n");
     if let Err(e) = virtio_blk::init() {
-        uart::locked_write(format_args!("FAIL: virtio init: {e}
-"));
+        uart::locked_write(format_args!("FAIL: virtio init: {e}\n"));
         crate::park()
     }
     static mut FAT_BUF: [u8; 65536] = [0u8; 65536];
@@ -210,40 +256,112 @@ fn selftest_fat() -> ! {
                             bytes = n;
                         }
                         Err(e) => {
-                            uart::locked_write(format_args!("FAIL: FAT read_file: {e}
-"));
+                            uart::locked_write(format_args!("FAIL: FAT read_file: {e}\n"));
                             crate::park()
                         }
                     }
+                    // GGUF parse: the model file must be well-formed GGUF v3.
                     match gguf::parse_and_dump(&buf[..file.size as usize]) {
                         Ok(info) => {
                             uart::locked_write(format_args!(
-                                "PASS: gguf parsed v{} tensors={}
-",
-                                info.version, info.tensor_count
+                                "PASS: gguf parsed v{} tensors={}\n",
+                                info.version,
+                                info.tensor_count
                             ));
                         }
                         Err(e) => {
-                            uart::locked_write(format_args!("FAIL: gguf: {e}
-"));
+                            uart::locked_write(format_args!("FAIL: gguf: {e}\n"));
                         }
                     }
                 }
                 uart::locked_write(format_args!(
-                    "PASS: FAT32 file read, {bytes} bytes
-"));
+                    "PASS: FAT32 file read, {bytes} bytes\n"
+                ));
             }
             Err(e) => {
-                uart::locked_write(format_args!("FAIL: FAT open: {e}
-"));
+                uart::locked_write(format_args!("FAIL: FAT open: {e}\n"));
             }
         },
         Err(e) => {
-            uart::locked_write(format_args!("FAIL: FAT mount: {e}
-"));
+            uart::locked_write(format_args!("FAIL: FAT mount: {e}\n"));
         }
     }
-    crate::park()
+    park()
+}
+
+/// Acceptance test (Pi-4): parallel sum over a 65536-element array across
+/// every core via the execution pool, matching the single-threaded
+/// reference exactly.
+#[cfg(feature = "selftest-pool")]
+#[repr(C)]
+struct PoolSumDesc {
+    data: *const u64,
+    len: usize,
+    partials: *mut u64,
+}
+
+#[cfg(feature = "selftest-pool")]
+fn selftest_pool() -> ! {
+    uart::write_str("selftest: parallel sum over 65536 elements\n");
+    static mut POOL_DATA: [u64; 65536] = [0; 65536];
+    static mut POOL_PARTIALS: [u64; 8] = [0; 8];
+
+    unsafe {
+        for i in 0..65536usize {
+            POOL_DATA[i] = (i % 251) as u64;
+        }
+    }
+
+    // Single-threaded reference.
+    let mut reference = 0u64;
+    // Soundness: POOL_DATA is exclusively owned by this selftest.
+    unsafe {
+        for i in 0..65536usize {
+            reference = reference.wrapping_add(POOL_DATA[i]);
+        }
+    }
+
+    // Parallel: split the array into per-core contiguous chunks.
+    let desc = PoolSumDesc {
+        data: &raw const POOL_DATA as *const u64,
+        len: 65536,
+        partials: &raw mut POOL_PARTIALS as *mut u64,
+    };
+    pool::run_on_all(pool_sum_job, &desc as *const PoolSumDesc as u64, board::CORE_COUNT);
+
+    let mut total = 0u64;
+    for p in 0..board::CORE_COUNT {
+        // Soundness: per-core slots, written before the pool barrier.
+        total = total.wrapping_add(unsafe { POOL_PARTIALS[p] });
+    }
+
+    if total == reference {
+        uart::locked_write(format_args!(
+            "pool: PASS sum={total} across {}/{} cores\n",
+            board::CORE_COUNT,
+            board::CORE_COUNT
+        ));
+    } else {
+        uart::locked_write(format_args!(
+            "FAIL: parallel sum {total} != reference {reference}\n"
+        ));
+    }
+    park()
+}
+
+#[cfg(feature = "selftest-pool")]
+fn pool_sum_job(core_id: usize, arg: u64) {
+    // Soundness: `arg` points at the PoolSumDesc published by the BSP for
+    // the duration of the job; chunks are disjoint per core.
+    let d = unsafe { &*(arg as *const PoolSumDesc) };
+    let chunk = d.len / board::CORE_COUNT;
+    let start = core_id * chunk;
+    let end = if core_id + 1 == board::CORE_COUNT { d.len } else { start + chunk };
+    let mut acc = 0u64;
+    for i in start..end {
+        acc = acc.wrapping_add(unsafe { d.data.add(i).read() });
+    }
+    unsafe { d.partials.add(core_id).write_volatile(acc) };
 }
 
 /// Panic path: print and park. Interrupts are masked at EL1.
