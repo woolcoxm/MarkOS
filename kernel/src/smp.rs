@@ -78,11 +78,12 @@ extern "C" fn secondary_main(core_id: u64) -> ! {
     for _ in 0..WORK_ITERATIONS {
         AP_WORK.fetch_add(1, Ordering::SeqCst);
     }
-    AP_ONLINE.fetch_add(1, Ordering::SeqCst);
     uart::locked_write(format_args!(
-        "ap: core {core_id} online, work contributed
-"
+        "ap: core {core_id} online, work contributed\n"
     ));
+    // Report online LAST: the BSP treats ONLINE as "this core is completely
+    // done", so its follow-up output cannot race the AP's log line.
+    AP_ONLINE.fetch_add(1, Ordering::SeqCst);
     crate::park()
 }
 

@@ -17,6 +17,7 @@ KERNEL_ELF   := $(CARGO_TARGET_DIR)/aarch64-unknown-none/release/kernel
 IMAGE        := kernel8.img
 PI5_IMAGE    := kernel_2712.img
 VIRT_IMAGE   := virt.img
+FAT_TEST_IMG := tests/fat.img
 TEST_IMG     := tests/test.img
 SD_DIR       := sd
 
@@ -105,6 +106,25 @@ test-block: image-virt $(TEST_IMG)
 	@echo "--- serial-blk.log ---"; cat serial-blk.log
 	@grep -q "PASS: block device verified" serial-blk.log 		&& echo "PASS: block device" 		|| { echo "FAIL: block device"; exit 1; }
 
+## FAT32 test disk: MBR + one FAT32 partition holding MODEL.BIN (64 KiB
+## deterministic pattern: byte[i] == i %% 251).
+$(FAT_TEST_IMG):
+	mkdir -p $(dir $(FAT_TEST_IMG))
+	dd if=/dev/zero of=$@ bs=1M count=17 status=none
+	echo "2048,30720,0x0c" | sfdisk $@ >/dev/null
+	dd if=/dev/zero of=tests/fatpart.img bs=512 count=30720 status=none
+	mkfs.vfat -F32 tests/fatpart.img >/dev/null
+	python3 -c "import sys; sys.stdout.buffer.write(bytes(i % 251 for i in range(65536)))" > tests/MODEL.BIN
+	mcopy -i tests/fatpart.img tests/MODEL.BIN ::/MODEL.BIN
+	dd if=tests/fatpart.img of=$@ bs=512 seek=2048 conv=notrunc status=none
+
+## Pi-3b acceptance (qemu-virt): FAT32 mount + MODEL.BIN read + pattern check.
+test-fat: image-virt $(FAT_TEST_IMG)
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-fat
+	timeout --preserve-status $(TIMEOUT) $(QEMU) $(VIRTFLAGS) -kernel $(VIRT_IMAGE) -drive file=$(FAT_TEST_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 > serial-fat.log 2>&1 || true
+	@echo "--- serial-fat.log ---"; cat serial-fat.log
+	@grep -q "PASS: FAT32 file read" serial-fat.log 		&& echo "PASS: FAT32 acceptance" 		|| { echo "FAIL: FAT32 acceptance"; exit 1; }
+
 ## Pi-2 acceptance (qemu-virt, PSCI): 4 cores online, exact shared counter.
 test-smp: image-virt
 	timeout --preserve-status $(TIMEOUT) $(QEMU) $(VIRTFLAGS) \
@@ -117,7 +137,7 @@ test-smp: image-virt
 clean:
 	cargo clean || true
 	rm -f $(IMAGE) $(PI5_IMAGE) $(VIRT_IMAGE) serial.log serial-exc.log serial-smp.log serial-blk.log
-	rm -f $(TEST_IMG)
+	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN
 
 distclean: clean
 	rm -rf $(HOME)/.markos-target

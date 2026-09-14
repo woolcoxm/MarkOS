@@ -1,0 +1,209 @@
+//! Minimal read-only FAT32 (over any block device).
+//!
+//! Scope decisions (appliance, not general FS):
+//! - MBR partition scan for the first FAT32 (type 0x0B/0x0C) partition.
+//! - 512-byte sectors, FAT32 only (FAT16/LFN not implemented — the
+//!   installer writes model files under fixed 8.3-safe names).
+//! - Full-cluster reads via the block layer; FAT entry lookups re-read the
+//!   FAT sector (correctness first — a FAT cache lands with the perf phase).
+//!
+//! owns: the mounted volume geometry (static, single volume).
+//! invariants: `mount` runs once on the BSP; all buffers passed in by
+//! callers are identity-mapped RAM.
+
+use core::fmt::Write as _;
+
+use crate::uart;
+
+use crate::virtio_blk;
+
+const SECTOR: usize = 512;
+const ATTR_LFN: u8 = 0x0F;
+const ATTR_DIR: u8 = 0x10;
+const EOC_MIN: u32 = 0x0FFF_FFF8;
+
+pub struct FatVolume {
+    part_lba: u64,
+    sectors_per_cluster: u32,
+    num_fats: u32,
+    fat_start_lba: u64,
+    fat_sectors: u32,
+    root_cluster: u32,
+}
+
+pub struct File {
+    pub first_cluster: u32,
+    pub size: u32,
+}
+
+fn rd16(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([buf[off], buf[off + 1]])
+}
+
+fn rd32(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+/// Scan MBR partition entries for a FAT32 partition; parse its boot sector.
+pub fn mount() -> Result<FatVolume, &'static str> {
+    let mut mbr = [0u8; SECTOR];
+    virtio_blk::read_sectors(0, 1, &mut mbr)?;
+    if mbr[510] != 0x55 || mbr[511] != 0xAA {
+        return Err("MBR signature missing");
+    }
+
+    let mut part_lba: Option<u64> = None;
+    for p in 0..4 {
+        let e = 446 + p * 16;
+        let ptype = mbr[e + 4];
+        if ptype == 0x0B || ptype == 0x0C {
+            part_lba = Some(rd32(&mbr, e + 8) as u64);
+            break;
+        }
+    }
+    let part_lba = part_lba.ok_or("no FAT32 partition in MBR")?;
+
+    let mut bs = [0u8; SECTOR];
+    virtio_blk::read_sectors(part_lba, 1, &mut bs)?;
+    if bs[510] != 0x55 || bs[511] != 0xAA {
+        return Err("FAT boot sector signature missing");
+    }
+    let sectors_per_cluster = bs[13] as u32;
+    let reserved_sectors = rd16(&bs, 14) as u32;
+    let num_fats = bs[16] as u32;
+    let fat_sectors = if rd16(&bs, 22) != 0 {
+        rd16(&bs, 22) as u32
+    } else {
+        rd32(&bs, 36)
+    };
+    let root_cluster = rd32(&bs, 44);
+    if sectors_per_cluster == 0 || num_fats == 0 || fat_sectors == 0 {
+        // Debug: show the first 16 bytes of what the guest read.
+        uart::locked_write(format_args!("fat: bs[0..16]={:02x?}\n", &bs[..16]));
+        return Err("FAT BPB fields invalid");
+    }
+
+    Ok(FatVolume {
+        part_lba,
+        sectors_per_cluster,
+        num_fats,
+        fat_start_lba: part_lba + reserved_sectors as u64,
+        fat_sectors,
+        root_cluster,
+    })
+}
+
+impl FatVolume {
+    fn cluster_lba(&self, cluster: u32) -> u64 {
+        let data_start = self.fat_start_lba + (self.fat_sectors as u64) * (self.num_fats as u64);
+        data_start + ((cluster as u64) - 2) * self.sectors_per_cluster as u64
+    }
+
+    /// FAT entry for `cluster` (FAT32: 32-bit LE, top 4 bits reserved).
+    fn fat_entry(&self, cluster: u32) -> Result<u32, &'static str> {
+        let mut sector = [0u8; SECTOR];
+        let fat_off_bytes = cluster as usize * 4;
+        let lba = self.fat_start_lba + (fat_off_bytes / SECTOR) as u64;
+        virtio_blk::read_sectors(lba, 1, &mut sector)?;
+        let off = fat_off_bytes % SECTOR;
+        Ok(rd32(&sector, off) & 0x0FFF_FFFF)
+    }
+
+    /// Read the whole cluster `cluster` into `buf`.
+    fn read_cluster(&self, cluster: u32, buf: &mut [u8]) -> Result<(), &'static str> {
+        virtio_blk::read_sectors(
+            self.cluster_lba(cluster),
+            self.sectors_per_cluster as usize,
+            buf,
+        )
+    }
+
+    /// Follow the cluster chain of `first_cluster`, passing each cluster's
+    /// bytes to `f`; stops when the chain ends or `f` returns false.
+    fn for_each_cluster<F>(&self, first: u32, mut f: F) -> Result<(), &'static str>
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        let csize = self.sectors_per_cluster as usize * SECTOR;
+        let mut cbuf = [0u8; 8 * SECTOR];
+        if csize > cbuf.len() {
+            return Err("cluster larger than 4 KiB scratch buffer");
+        }
+        let mut cluster = Some(first);
+        while let Some(c) = cluster {
+            self.read_cluster(c, &mut cbuf[..csize])?;
+            if !f(&cbuf[..csize]) {
+                return Ok(());
+            }
+            cluster = match self.fat_entry(c)? {
+                next if next >= EOC_MIN => None,
+                0 => None,
+                next => Some(next),
+            };
+        }
+        Ok(())
+    }
+
+    /// Find `MODEL.BIN` (raw 8.3 short name) in the root directory.
+    pub fn open_model(&self) -> Result<File, &'static str> {
+        // Short name: "MODEL" padded to 8 + "BIN"; case-insensitive compare.
+        let mut want = [0x20u8; 11];
+        want[..5].copy_from_slice(b"MODEL");
+        want[8..11].copy_from_slice(b"BIN");
+
+        let mut found: Option<File> = None;
+        let mut done = false;
+        self.for_each_cluster(self.root_cluster, |chunk| {
+            for e in 0..chunk.len() / 32 {
+                let entry = &chunk[e * 32..(e + 1) * 32];
+                if entry[0] == 0x00 {
+                    return false; // end of directory
+                }
+                if entry[0] == 0xE5 || entry[11] == ATTR_LFN || entry[11] & ATTR_DIR != 0 {
+                    continue; // deleted / long-name / subdirectory
+                }
+                let m = entry[..11]
+                    .iter()
+                    .zip(want.iter())
+                    .all(|(a, b)| a.to_ascii_uppercase() == *b);
+                if m {
+                    found = Some(File {
+                        first_cluster: (rd16(entry, 20) as u32) << 16 | rd16(entry, 26) as u32,
+                        size: rd32(entry, 28),
+                    });
+                    done = true;
+                    return false;
+                }
+            }
+            true
+        })?;
+        let _ = done;
+        found.ok_or("MODEL.BIN not found in volume root")
+    }
+
+    /// Read the entire file into `buf`; returns the number of bytes read.
+    pub fn read_file(&self, file: &File, buf: &mut [u8]) -> Result<usize, &'static str> {
+        if (buf.len() as u64) < file.size as u64 {
+            return Err("file larger than buffer");
+        }
+        let csize = self.sectors_per_cluster as usize * SECTOR;
+        let mut written = 0usize;
+        let mut cluster = Some(file.first_cluster);
+        while let Some(c) = cluster {
+            if written + csize > buf.len() {
+                break;
+            }
+            self.read_cluster(c, &mut buf[written..written + csize])?;
+            written += csize;
+            if written >= file.size as usize {
+                break;
+            }
+            cluster = match self.fat_entry(c)? {
+                next if next >= EOC_MIN => None,
+                0 => None,
+                next => Some(next),
+            };
+        }
+        Ok(written)
+    }
+}

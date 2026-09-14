@@ -21,3 +21,4 @@ board-virt = []
 # Acceptance-test builds; never enabled by default.
 selftest-exceptions = []
 selftest-block = []
+selftest-fat = []

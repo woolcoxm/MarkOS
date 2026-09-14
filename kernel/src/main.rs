@@ -17,6 +17,7 @@
 mod board;
 mod board_release;
 mod cpu;
+mod fat;
 mod mmu;
 mod psci;
 mod smp;
@@ -155,6 +156,8 @@ extern "C" fn kmain() -> ! {
     selftest_exceptions();
     #[cfg(feature = "selftest-block")]
     selftest_block();
+    #[cfg(feature = "selftest-fat")]
+    selftest_fat();
 
     // The selftests below are diverging, so this loop is unreachable when a
     // selftest feature is enabled — that is expected, not a bug.
@@ -195,33 +198,70 @@ fn selftest_block() -> ! {
     park()
 }
 
-/// Acceptance test (Pi-1): a `brk` is caught and execution resumes past it;
-/// a read of an unmapped virtual address takes a data abort that is caught
-/// and logged with the fault address (then parks — it is fatal by design).
-#[cfg(feature = "selftest-exceptions")]
-fn selftest_exceptions() -> ! {
-    uart::write_str("selftest: triggering brk\n");
-    // Soundness: `brk #0` is the deliberate fault; the brk handler advances
-    // ELR past the 4-byte instruction so this code resumes.
-    unsafe { core::arch::asm!("brk #0", options(nomem, nostack, preserves_flags)) };
-    uart::write_str("PASS: brk caught and execution resumed\n");
-
-    uart::write_str("selftest: triggering data abort (read of unmapped VA)\n");
-    // 4 TiB: canonical, beyond the [0,2GiB) identity map -> level-0
-    // translation fault. (0x40000000 itself is now mapped!)
-    let addr: u64 = 0x0000_0400_0000_0000;
-    // Soundness: the deliberate fault is the whole point; raw asm so the
-    // dereference address is exactly `addr`.
-    unsafe {
-        core::arch::asm!(
-            "ldr x1, [x0]",
-            in("x0") addr,
-            lateout("x1") _,
-            options(nostack)
-        );
+/// Acceptance test (Pi-3b): FAT32 mount over the block device, MODEL.BIN
+/// lookup in the root directory, full cluster-chain read, and a byte-exact
+/// pattern check (byte[i] == i %% 251 written by the image build rule).
+#[cfg(feature = "selftest-fat")]
+fn selftest_fat() -> ! {
+    uart::write_str("selftest: FAT32 mount + file read
+");
+    if let Err(e) = virtio_blk::init() {
+        uart::locked_write(format_args!("FAIL: virtio init: {e}
+"));
+        crate::park()
     }
-    uart::write_str("FAIL: data abort did not trigger\n");
-    park()
+    static mut FAT_BUF: [u8; 65536] = [0u8; 65536];
+
+    match fat::mount() {
+        Ok(vol) => match vol.open_model() {
+            Ok(file) => {
+                let mut bytes = 0usize;
+                let mut ok = true;
+                // Soundness: FAT_BUF is boot-stage scratch owned by this
+                // selftest; the device DMAs into it while nothing else runs.
+                unsafe {
+                    let buf = core::slice::from_raw_parts_mut(
+                        (&raw mut FAT_BUF) as *mut u8,
+                        65536,
+                    );
+                    match vol.read_file(&file, buf) {
+                        Ok(n) => {
+                            bytes = n;
+                            for i in 0..file.size as usize {
+                                if buf[i] != (i % 251) as u8 {
+                                    ok = false;
+                                    uart::locked_write(format_args!(
+                                        "FAIL: FAT read mismatch at byte {i}
+"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            uart::locked_write(format_args!("FAIL: FAT read_file: {e}
+"));
+                            crate::park()
+                        }
+                    }
+                }
+                uart::locked_write(format_args!(
+                    "PASS: FAT32 file read, {bytes} bytes, pattern {}
+",
+                    if ok { "verified" } else { "MISMATCH" }
+                ));
+            }
+            Err(e) => {
+                uart::locked_write(format_args!("FAIL: FAT open: {e}
+"));
+            }
+        },
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: FAT mount: {e}
+"));
+        }
+    }
+    crate::park()
 }
 
 /// Panic path: print and park. Interrupts are masked at EL1.

@@ -2,8 +2,11 @@
 //!
 //! owns: nothing; the UART is platform hardware. The base address comes
 //! from the board layer (see board.rs).
-//! invariants: single-writer at a time during bring-up; later phases route
-//! all output through a lock.
+//! invariants:
+//! - `locked_write`/`write_str` serialize output across cores once SMP is
+//!   up; the `Serial` adapter writes RAW bytes and must only be used while
+//!   TX_LOCK is held (or single-core).
+//! - The panic handler uses raw writes: it must never block on the lock.
 
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -49,12 +52,23 @@ pub fn write_byte(b: u8) {
     }
 }
 
+/// Raw byte writer — no locking. Callers either hold TX_LOCK or accept
+/// interleaving (panic path).
+fn write_str_raw(s: &str) {
+    for b in s.bytes() {
+        if b == b'\n' {
+            write_byte(b'\r');
+        }
+        write_byte(b);
+    }
+}
+
 /// Serial transmit lock: cores print concurrently once SMP is up; without
 /// this, multi-core log lines interleave mid-write (observed live).
 static TX_LOCK: AtomicBool = AtomicBool::new(false);
 
-/// Lock-protected formatted write: the whole line lands as one unit, so
-/// multi-core output does not interleave mid-line.
+/// Lock-protected formatted write: the whole formatted output lands as one
+/// unit, so multi-core output does not interleave mid-line.
 pub fn locked_write(args: fmt::Arguments) {
     while TX_LOCK
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -67,20 +81,16 @@ pub fn locked_write(args: fmt::Arguments) {
 }
 
 pub fn write_str(s: &str) {
-    for b in s.bytes() {
-        if b == b'\n' {
-            write_byte(b'\r');
-        }
-        write_byte(b);
-    }
+    locked_write(format_args!("{}", s));
 }
 
-/// `core::fmt::Write` adapter so `write!` works without alloc.
+/// `core::fmt::Write` adapter so `write!` works without alloc. Writes raw
+/// bytes (used only while TX_LOCK is held, via locked_write).
 pub struct Serial;
 
 impl fmt::Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        write_str(s);
+        write_str_raw(s);
         Ok(())
     }
 }

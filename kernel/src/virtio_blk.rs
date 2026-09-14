@@ -127,6 +127,8 @@ static mut REQ: BlkReq = BlkReq {
 };
 
 static mut DEV_BASE: u64 = 0;
+/// Used-ring index already consumed by the driver (poll completion).
+static mut LAST_USED_IDX: u16 = 0;
 
 fn rd32(base: u64, offset: u64) -> u32 {
     // Soundness: virtio-mmio device registers, identity-mapped; volatile is
@@ -241,6 +243,10 @@ pub fn read_sectors(lba: u64, count: usize, buf: &mut [u8]) -> Result<(), &'stat
         let req_addr = (&raw const REQ) as u64;
 
         // Request header: type 0 = IN (read sectors into the data buffer).
+        let req = &raw mut REQ;
+        (*req).hdr_type = 0;
+        (*req).hdr_reserved = 0;
+        (*req).hdr_sector = lba;
         (*vq).desc[0] = Desc { addr: req_addr, len: 16, flags: DESC_NEXT, next: 1 };
         (*vq).desc[1] = Desc {
             addr: buf.as_mut_ptr() as u64,
@@ -263,7 +269,7 @@ pub fn read_sectors(lba: u64, count: usize, buf: &mut [u8]) -> Result<(), &'stat
     unsafe {
         let vq = &raw mut VQ;
         let mut polls = 0u64;
-        while (*vq).used.idx == 0 {
+        while (*vq).used.idx == LAST_USED_IDX {
             spin_loop();
             polls += 1;
             if polls > 50_000_000 {
@@ -273,6 +279,7 @@ pub fn read_sectors(lba: u64, count: usize, buf: &mut [u8]) -> Result<(), &'stat
                 return Err("block read timed out");
             }
         }
+        LAST_USED_IDX = (*vq).used.idx;
     }
 
     // The device wrote the status byte into REQ.status.
