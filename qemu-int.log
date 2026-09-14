@@ -1,0 +1,12 @@
+Exception return from AArch64 EL2 to AArch64 EL1 PC 0x800a0
+Taking exception 7 [Breakpoint] on CPU 0
+...from EL1 to EL1
+...with ESR 0x3c/0xf2000000
+...with ELR 0x80b64
+...to EL1 PC 0x80a00 PSTATE 0x3c5
+Taking exception 4 [Data Abort] on CPU 0
+...from EL1 to EL1
+...with ESR 0x25/0x96000004
+...with FAR 0x3940000a910043fd
+...with ELR 0x81048
+...to EL1 PC 0x80a00 PSTATE 0x3c5

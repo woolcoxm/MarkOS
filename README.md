@@ -53,7 +53,7 @@ system console.
 ## Roadmap (Pi-first)
 
 - [x] Pi-0 — AArch64 bring-up: boots in QEMU raspi3b, `kernel alive` on PL011
-- [ ] Pi-1 — MMU page tables, exception vectors (VBAR), generic timer
+- [x] Pi-1 — MMU page tables, exception vectors (VBAR), generic timer
 - [ ] Pi-2 — GIC-400, SMP: all cores online, shared-counter acceptance
 - [ ] Pi-3 — SD card driver (SDHCI) + minimal FAT reader + GGUF load
 - [ ] Pi-4 — NEON int8 matmul kernels (UDOT), work-stealing pool, 2 MiB blocks

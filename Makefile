@@ -1,7 +1,8 @@
 # MarkOS build orchestration (AArch64 / Raspberry Pi).
 # All commands run inside WSL (Ubuntu 24.04): the host Windows side only
 # stores the sources. Requires: rustup nightly + aarch64-unknown-none target,
-# objcopy, qemu-system-aarch64 (dev loop), mtools/xorriso for SD images.
+# llvm-objcopy (from rustup's llvm-tools), qemu-system-aarch64 (dev loop),
+# mtools/xorriso for SD images (installer phase).
 
 SHELL := /bin/bash
 
@@ -22,12 +23,16 @@ QEMU        := qemu-system-aarch64
 QEMUFLAGS   := -M raspi3b -serial stdio -display none -no-reboot
 TIMEOUT     := 25
 
-.PHONY: all kernel image run run-log sd clean distclean
+# Optional cargo features for acceptance-test builds.
+KERNEL_FEATURES ?=
+FEATURES_ARG := $(if $(KERNEL_FEATURES),--features $(KERNEL_FEATURES),)
+
+.PHONY: all kernel image run run-log test-exceptions clean distclean
 
 all: image
 
 kernel:
-	cargo build --release --target $(TARGET)
+	cargo build --release --target $(TARGET) $(FEATURES_ARG)
 
 ## Raw kernel image the Pi firmware (or QEMU -kernel) loads at 0x80000.
 image: $(IMAGE)
@@ -46,9 +51,22 @@ run-log: image
 run: image
 	$(QEMU) $(QEMUFLAGS) -kernel $(IMAGE)
 
+## Pi-1 acceptance: brk caught+resumed, data abort caught+logged, MMU/timer logs.
+test-exceptions:
+	$(MAKE) image KERNEL_FEATURES=selftest-exceptions
+	timeout --preserve-status $(TIMEOUT) $(QEMU) $(QEMUFLAGS) \
+		-kernel $(IMAGE) > serial-exc.log 2>&1 || true
+	@echo "--- serial-exc.log ---"
+	@cat serial-exc.log
+	@grep -q "CAUGHT exception: brk" serial-exc.log \
+		&& grep -q "PASS: brk caught" serial-exc.log \
+		&& grep -q "CAUGHT exception: data_abort" serial-exc.log \
+		&& echo "PASS: exception handling (brk resumed, data abort caught)" \
+		|| { echo "FAIL: exception handling"; exit 1; }
+
 clean:
 	cargo clean || true
-	rm -f $(IMAGE) serial.log
+	rm -f $(IMAGE) serial.log serial-exc.log
 
 distclean: clean
 	rm -rf $(HOME)/.markos-target

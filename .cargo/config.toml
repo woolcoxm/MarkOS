@@ -1,8 +1,2 @@
 [build]
 target = "aarch64-unknown-none"
-
-# Bare-metal AArch64 convention: forbid implicit unaligned accesses (the
-# Rust Embedded book recommendation for this target; `strict-align` was
-# renamed to the negated `unaligned-scalar-mem` in newer rustc).
-[target.aarch64-unknown-none]
-rustflags = ["-C", "target-feature=-unaligned-scalar-mem"]

@@ -11,3 +11,7 @@ path = "src/main.rs"
 [dependencies]
 # Deliberately dependency-free at bring-up; platform crates are added only
 # when a phase actually needs them.
+
+# Acceptance-test builds; never enabled by default.
+[features]
+selftest-exceptions = []
