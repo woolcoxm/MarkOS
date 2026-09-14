@@ -19,8 +19,13 @@ IMAGE        := markos.iso
 
 QEMU     := qemu-system-x86_64
 QEMUFLAGS := -M q35 -m 2G -smp 1 -display none -no-reboot
+TIMEOUT  := 25
 
-.PHONY: all kernel deps iso run run-log debug clean distclean
+# Optional cargo features for acceptance-test builds (e.g. selftest-div).
+KERNEL_FEATURES ?=
+FEATURES_ARG := $(if $(KERNEL_FEATURES),--features $(KERNEL_FEATURES),)
+
+.PHONY: all kernel deps iso run run-log debug test-div test-pf test-phase1 clean distclean
 
 all: iso
 
@@ -35,7 +40,7 @@ $(LIMINE_TOOL):
 	chmod +x $(LIMINE_TOOL)
 
 kernel:
-	cargo build -Zunstable-options -Zjson-target-spec --release --target $(KERNEL_JSON)
+	cargo build -Zunstable-options -Zjson-target-spec --release --target $(KERNEL_JSON) $(FEATURES_ARG)
 
 ## Build the bootable ISO (BIOS + UEFI capable) and install the Limine stages.
 iso: kernel $(LIMINE_TOOL)
@@ -70,6 +75,29 @@ run-log: iso
 ## gdb in another: target remote :1234).
 debug: iso
 	$(QEMU) $(QEMUFLAGS) -cdrom $(IMAGE) -boot d -serial stdio -s -S
+
+## Phase 1 acceptance, part 1: deliberate divide-by-zero is caught and logged.
+test-div:
+	$(MAKE) iso KERNEL_FEATURES=selftest-div
+	timeout --preserve-status $(TIMEOUT) $(QEMU) $(QEMUFLAGS) -cdrom $(IMAGE) -boot d \
+		-serial stdio > serial-div.log 2>&1 || true
+	@echo "--- serial-div.log ---"; cat serial-div.log
+	@grep -q "CAUGHT exception: divide_error" serial-div.log \
+		&& echo "PASS: divide_error caught and logged (no triple fault)" \
+		|| { echo "FAIL: divide_error not caught"; exit 1; }
+
+## Phase 1 acceptance, part 2: deliberate page fault is caught and logged.
+test-pf:
+	$(MAKE) iso KERNEL_FEATURES=selftest-pf
+	timeout --preserve-status $(TIMEOUT) $(QEMU) $(QEMUFLAGS) -cdrom $(IMAGE) -boot d \
+		-serial stdio > serial-pf.log 2>&1 || true
+	@echo "--- serial-pf.log ---"; cat serial-pf.log
+	@grep -q "CAUGHT exception: page_fault" serial-pf.log \
+		&& echo "PASS: page_fault caught and logged (no triple fault)" \
+		|| { echo "FAIL: page_fault not caught"; exit 1; }
+
+## Full Phase 1 acceptance: both deliberate faults, two boots.
+test-phase1: test-div test-pf
 
 clean:
 	cargo clean || true

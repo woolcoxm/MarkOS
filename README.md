@@ -44,7 +44,7 @@ to the terminal; `make debug` starts QEMU paused with a GDB stub on :1234.
 ## Phase status
 
 - [x] Phase 0 — scaffold: boots in QEMU, prints `kernel alive` on COM1, halts
-- [ ] Phase 1 — GDT, IDT, TSS, exception handlers, panic register dump
+- [x] Phase 1 — GDT, IDT, TSS, exception handlers, panic register dump
 - [ ] Phase 2 — physical frame allocator (bitmap)
 - [ ] Phase 3 — page tables + kernel heap
 - [ ] Phase 4 — SMP bring-up (ACPI MADT, INIT-SIPI-SIPI)
