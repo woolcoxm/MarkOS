@@ -15,6 +15,7 @@
 use core::arch::asm;
 use core::fmt::Write as _;
 
+use crate::board;
 use crate::uart;
 
 const ENTRIES: usize = 512;
@@ -30,6 +31,14 @@ static mut L2: PageTable = PageTable([0; ENTRIES]);
 static mut L2B: PageTable = PageTable([0; ENTRIES]);
 /// L3 refining the first 2 MiB above 1 GiB to Device pages (mailboxes).
 static mut L3B: PageTable = PageTable([0; ENTRIES]);
+/// L2 for the PCIe ECAM window (Pi-7a): the virt machine's ECAM sits at
+/// 256 GiB — a whole L0/L1 granule away from the identity map. Only built
+/// when the window's L1 slot is clear of [0, 2 GiB).
+static mut L2C: PageTable = PageTable([0; ENTRIES]);
+
+const ECAM_BASE: u64 = board::PCIE_ECAM_BASE as u64;
+const ECAM_SIZE: u64 = 256 * 1024 * 1024; // 8-bit bus window
+const ECAM_L1_IDX: usize = ((ECAM_BASE >> 30) as usize) & (ENTRIES - 1);
 
 /// Pi 3/4 legacy peripheral base (QEMU raspi3b matches the Pi 3 layout).
 const PERIPH_BASE: u64 = 0x3F00_0000;
@@ -48,9 +57,11 @@ const PXN: u64 = 1 << 53;
 
 // MAIR_EL1: attr0 = Device-nGnRE (0x04), attr1 = Normal WB/WA/RW (0xFF).
 const MAIR: u64 = 0x04 | (0xFF << 8);
-// TCR_EL1: T0SZ=16, 4K granule, WB cacheability, inner-shareable, PS=4GB,
-// T1SZ=16 (upper half unused but sized).
-const TCR: u64 = 16 | (1 << 8) | (1 << 10) | (3 << 12) | (16 << 16);
+// TCR_EL1: T0SZ=16, 4K granule, WB cacheability, inner-shareable,
+// T1SZ=16 (upper half unused but sized), IPS=1TB (bits[34:32]) — the
+// ECAM window lives above 4 GiB physical, so the default 4 GB output
+// range will not do.
+const TCR: u64 = 16 | (1 << 8) | (1 << 10) | (3 << 12) | (16 << 16) | (2 << 32);
 
 fn table_addr(t: *const PageTable) -> u64 {
     // Soundness: statics in the kernel image, 4 KiB aligned by repr(C, align).
@@ -69,6 +80,7 @@ fn build_tables() {
         let l2 = &raw mut L2;
         let l2b = &raw mut L2B;
         let l3b = &raw mut L3B;
+        let l2c = &raw mut L2C;
 
         // VA [0,1GiB): L0[0] -> L1[0] -> L2 (RAM + legacy peripherals).
         // VA [1GiB,2GiB): L1[1] under the SAME L0 — L0 indexes bits[47:39],
@@ -106,6 +118,24 @@ fn build_tables() {
             } else {
                 addr | VALID | 0b10 | ATTR_NORMAL | AF
             };
+        }
+
+        // PCIe ECAM window (Pi-7a): map Device+PXN blocks so the config
+        // walk in pcie.rs can read it. Only when its L1 slot doesn't
+        // collide with the identity map (idx 0 = the first GiB, idx 1 =
+        // the second) — the unverified Pi 5 placeholder resolves to idx 0
+        // and is skipped until its real address is confirmed.
+        if ECAM_L1_IDX >= 2 {
+            (*l1).0[ECAM_L1_IDX] = table_addr(l2c) | VALID | TABLE;
+            // The window is generally NOT granule-aligned: L2C[i] covers
+            // PA granule_base + i*2MiB, so the first descriptor lands at
+            // the window's offset inside its 1 GiB granule, not slot 0.
+            let start = ((ECAM_BASE >> 21) as usize) & (ENTRIES - 1);
+            let blocks = (ECAM_SIZE / BLOCK) as usize;
+            for i in 0..blocks {
+                let addr = ECAM_BASE + (i as u64) * BLOCK;
+                (*l2c).0[start + i] = addr | VALID | ATTR_DEVICE | AF | PXN;
+            }
         }
     }
 }

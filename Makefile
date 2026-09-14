@@ -188,6 +188,17 @@ test-install: $(INSTALL_IMG)
 	kill $$qpid 2>/dev/null; \
 	[ $$rc -eq 0 ] && echo "PASS: install config + auth" || { echo "FAIL: install config + auth"; exit 1; }
 
+## Pi-7a acceptance (qemu-virt): PCIe ECAM enumeration — the root port
+## (Red Hat 1b36:000c) must be found by the bare-metal config-space walk.
+test-pcie: image-virt
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-pcie
+	timeout --preserve-status $(TIMEOUT) $(QEMU) $(VIRTFLAGS) \
+		-kernel $(VIRT_IMAGE) -device pcie-root-port > serial-pcie.log 2>&1 || true
+	@echo "--- serial-pcie.log ---"; cat serial-pcie.log
+	@grep -q "PASS: pcie enumerated" serial-pcie.log \
+		&& echo "PASS: pcie enumeration" \
+		|| { echo "FAIL: pcie enumeration"; exit 1; }
+
 ## Pi-2 acceptance (qemu-virt, PSCI): 4 cores online, exact shared counter.
 test-smp: image-virt
 	timeout --preserve-status $(TIMEOUT) $(QEMU) $(VIRTFLAGS) \

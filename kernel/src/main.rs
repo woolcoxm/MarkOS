@@ -23,6 +23,7 @@ mod gguf;
 mod matmul;
 mod mmu;
 mod net;
+mod pcie;
 mod pool;
 mod psci;
 mod smp;
@@ -192,6 +193,8 @@ extern "C" fn kmain() -> ! {
     selftest_matmul();
     #[cfg(feature = "selftest-net")]
     selftest_net();
+    #[cfg(feature = "selftest-pcie")]
+    selftest_pcie();
 
     // The loop below is unreachable when a diverging selftest ran.
     #[allow(unreachable_code)]
@@ -574,6 +577,30 @@ fn pool_sum_job(core_id: usize, arg: u64) {
         acc = acc.wrapping_add(unsafe { d.data.add(i).read() });
     }
     unsafe { d.partials.add(core_id).write_volatile(acc) };
+}
+
+/// Pi-7a acceptance: PCIe ECAM walk on the virt machine. The QEMU command
+/// line attaches a pcie-root-port (Red Hat vendor 1b36) — finding it proves
+/// the config-space walk; the same code targets the BCM2712 root complex
+/// and the LLM8850 endpoint on real hardware.
+#[cfg(feature = "selftest-pcie")]
+fn selftest_pcie() -> ! {
+    uart::write_str("selftest: PCIe ECAM enumeration\n");
+    let n = pcie::scan();
+    let mut out = [pcie::Device::ZERO; 8];
+    let found = pcie::devices(&mut out);
+    let has_root_port = out[..found].iter().any(|d| d.vendor_id == 0x1B36);
+    if found > 0 && has_root_port {
+        uart::locked_write(format_args!(
+            "PASS: pcie enumerated {found} device(s), root port present\n"
+        ));
+    } else {
+        uart::locked_write(format_args!(
+            "FAIL: pcie scan found {n} device(s), root port={}\n",
+            has_root_port
+        ));
+    }
+    park()
 }
 
 /// Panic path: print and park. Interrupts are masked at EL1.

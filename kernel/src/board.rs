@@ -18,6 +18,11 @@ pub const UART_BASE: usize = 0x0900_0000;
 pub const CORE_COUNT: usize = 4;
 #[cfg(feature = "board-virt")]
 pub const NAME: &str = "qemu-virt";
+/// Generic ECAM config space of the virt machine's PCIe host (gpex).
+/// QEMU 8.2's highmem virt places it at 256 GiB + 256 MiB (verified via
+/// `info mtree`: "pcie-ecam @ 0000004010000000-000000401fffffff").
+#[cfg(feature = "board-virt")]
+pub const PCIE_ECAM_BASE: usize = 0x0000_0040_1000_0000;
 
 #[cfg(feature = "board-pi")]
 pub const UART_BASE: usize = 0x3F20_1000;
@@ -25,3 +30,9 @@ pub const UART_BASE: usize = 0x3F20_1000;
 pub const CORE_COUNT: usize = 4;
 #[cfg(feature = "board-pi")]
 pub const NAME: &str = "raspi (pi3-qemu / pi4-pi5 hw)";
+/// Pi 5 (BCM2712): PCIe3 root complex ECAM window. UNVERIFIED placeholder —
+/// confirm against the BCM2712 memory map before any Pi 5 PCIe work
+/// (Pi-7b, hardware-gated). Kept below 2 GiB-shifted so the generic mmu
+/// guard skips building a mapping for it.
+#[cfg(feature = "board-pi")]
+pub const PCIE_ECAM_BASE: usize = 0x0000_1000_1200_0000;
