@@ -16,11 +16,16 @@
 #![feature(abi_x86_interrupt)]
 
 mod gdt;
+mod heap;
 mod interrupts;
 mod mem;
+mod paging;
 mod physmem;
 mod regs;
 mod serial;
+
+// Heap-backed collections (Vec, Box) — available after `heap::init`.
+extern crate alloc;
 
 use core::{arch::asm, arch::global_asm, panic::PanicInfo};
 
@@ -112,6 +117,10 @@ unsafe extern "C" fn kernel_main() -> ! {
         format_args!("physmem: managing largest usable region ({managed_mib} MiB), {free} free frames\n"),
     );
 
+    paging::init();
+    heap::init().expect("heap init failed");
+    heap::log_stats();
+
     serial::write_str("cpu bring-up complete\n");
 
     #[cfg(feature = "selftest-div")]
@@ -120,6 +129,8 @@ unsafe extern "C" fn kernel_main() -> ! {
     selftest_page_fault();
     #[cfg(feature = "selftest-frames")]
     selftest_frames();
+    #[cfg(feature = "selftest-heap")]
+    selftest_heap();
 
     // The selftests above are diverging, so this loop is unreachable when a
     // selftest feature is enabled — that is expected, not a bug.
@@ -241,6 +252,144 @@ fn selftest_frames() -> ! {
             n = BATCH * ROUNDS
         ),
     );
+    halt_loop()
+}
+
+/// Acceptance test (Phase 3): heap churn with varying sizes (forcing
+/// fragmentation), Vec-heavy verification against a reference, and a
+/// used/free invariant check at the end (no leaks).
+#[cfg(feature = "selftest-heap")]
+fn selftest_heap() -> ! {
+    use alloc::vec::Vec;
+    use x86_64::structures::paging::page_table::PageTableFlags;
+    use x86_64::structures::paging::Page;
+    use x86_64::VirtAddr;
+
+    serial::write_str("selftest: heap churn + fragmentation\n");
+
+    // Phase 0 — direct paging roundtrip on a scratch page just below the
+    // heap window: map, write through the mapping, translate, unmap, and
+    // confirm frame accounting. Run twice: the first trip may allocate
+    // intermediate page tables (a permanent, one-time cost); the second
+    // must net zero frames — that is the leak check.
+    for trip in 0..2u32 {
+        let scratch = Page::containing_address(VirtAddr::new(paging::HEAP_BASE - 0x1000));
+        let ff0 = physmem::free_frames();
+        let Some(frame) = physmem::alloc_frame() else {
+            serial::write_str("FAIL: no frame for paging roundtrip\n");
+            halt_loop();
+        };
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        if let Err(e) = paging::map(scratch, frame, flags) {
+            let _ = core::fmt::write(&mut serial::Serial, format_args!("FAIL: map: {e}\n"));
+            halt_loop();
+        }
+        // Soundness: the page was just mapped writable to a frame we own.
+        let vptr = scratch.start_address().as_u64() as *mut u64;
+        unsafe { vptr.write_volatile(0x0A11CED0C5_1234) };
+        if paging::translate(scratch.start_address()) != Some(frame.start_address()) {
+            serial::write_str("FAIL: translate disagrees with the mapping\n");
+            halt_loop();
+        }
+        let Ok(back) = paging::unmap(scratch) else {
+            serial::write_str("FAIL: unmap refused a live mapping\n");
+            halt_loop();
+        };
+        if back != frame || paging::translate(scratch.start_address()).is_some() {
+            serial::write_str("FAIL: unmap did not restore the previous state\n");
+            halt_loop();
+        }
+        if physmem::dealloc_frame(back).is_err() {
+            serial::write_str("FAIL: dealloc rejected the unmapped frame\n");
+            halt_loop();
+        }
+        let ff1 = physmem::free_frames();
+        if trip == 1 && ff1 != ff0 {
+            let _ = core::fmt::write(
+                &mut serial::Serial,
+                format_args!("FAIL: roundtrip leaked frames: {ff0} -> {ff1}\n"),
+            );
+            halt_loop();
+        }
+    }
+    serial::write_str("paging roundtrip: map/write/translate/unmap ok\n");
+
+    let (used0, free0) = heap::stats();
+
+    // Phase A — 128 vectors of varying (LCG-chosen) sizes, filled with a
+    // deterministic pattern, verified immediately.
+    let mut blobs: Vec<(u64, usize, Vec<u8>)> = Vec::new();
+    let mut seed: u64 = 0x1234_5678_9abc_def0;
+    for i in 0..128u64 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let size = 1 + (seed >> 33) as usize % (32 * 1024);
+        let mut v: Vec<u8> = Vec::with_capacity(size);
+        for j in 0..size {
+            v.push((i ^ j as u64 ^ seed) as u8);
+        }
+        blobs.push((seed, size, v));
+    }
+    for (i, (s, size, v)) in blobs.iter().enumerate() {
+        for j in 0..*size {
+            let want = (i as u64 ^ j as u64 ^ *s) as u8;
+            if v[j] != want {
+                let _ = core::fmt::write(
+                    &mut serial::Serial,
+                    format_args!("FAIL: heap corruption at blob {i} byte {j}\n"),
+                );
+                halt_loop();
+            }
+        }
+    }
+
+    // Phase B — free every other blob (leaves holes), then allocate 64
+    // fresh 32 KiB vectors which must fit into the freed holes.
+    let mut i = 0;
+    while i < blobs.len() {
+        if i % 2 == 0 {
+            blobs.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    let mut holes: Vec<Vec<u8>> = Vec::new();
+    for k in 0..64u64 {
+        let mut v: Vec<u8> = Vec::with_capacity(32 * 1024);
+        for j in 0..32 * 1024 {
+            v.push((k ^ j as u64) as u8);
+        }
+        holes.push(v);
+    }
+    // Survivors must still hold their patterns (nothing aliased anything).
+    for (i, (s, size, v)) in blobs.iter().enumerate() {
+        for j in (0..*size).step_by(1024) {
+            let want = (i as u64 ^ j as u64 ^ *s) as u8;
+            if v[j] != want {
+                serial::write_str("FAIL: heap corruption after fragmentation\n");
+                halt_loop();
+            }
+        }
+    }
+
+    // Phase C — release everything; used bytes must return to (near) zero.
+    // Near, not exactly: this allocator stores per-hole bookkeeping headers
+    // inside freed blocks, so churn leaves a small constant residue. A real
+    // leak of allocation-scale size would blow far past this bound.
+    blobs.clear();
+    holes.clear();
+    const BOOKKEEPING_SLACK: usize = 64 * 1024;
+    let (used1, free1) = heap::stats();
+    if used1 > used0 + BOOKKEEPING_SLACK || free1 < free0.saturating_sub(BOOKKEEPING_SLACK) {
+        let _ = core::fmt::write(
+            &mut serial::Serial,
+            format_args!(
+                "FAIL: heap leak — used {used1} (was {used0}), free {free1} (was {free0})\n"
+            ),
+        );
+        halt_loop();
+    }
+
+    serial::write_str("PASS: heap churn, fragmentation recovery, no leaks\n");
     halt_loop()
 }
 

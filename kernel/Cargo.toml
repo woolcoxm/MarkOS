@@ -12,9 +12,11 @@ path = "src/main.rs"
 limine = "0.6"
 x86_64 = "0.15"
 spin = "0.10"
+linked_list_allocator = "0.10"
 
 # Deliberate-fault acceptance tests (Phase 1); never enabled by default.
 [features]
 selftest-div = []
 selftest-pf = []
 selftest-frames = []
+selftest-heap = []

@@ -111,6 +111,18 @@ test-frames:
 
 test-phase2: test-frames
 
+## Phase 3 acceptance: heap churn, fragmentation recovery, leak check.
+test-heap:
+	$(MAKE) iso KERNEL_FEATURES=selftest-heap
+	timeout --preserve-status $(TIMEOUT) $(QEMU) $(QEMUFLAGS) -cdrom $(IMAGE) -boot d \
+		-serial stdio > serial-heap.log 2>&1 || true
+	@echo "--- serial-heap.log ---"; cat serial-heap.log
+	@grep -q "PASS: heap churn" serial-heap.log \
+		&& echo "PASS: kernel heap acceptance" \
+		|| { echo "FAIL: kernel heap acceptance"; exit 1; }
+
+test-phase3: test-heap
+
 clean:
 	cargo clean || true
 	rm -f $(IMAGE) serial.log
