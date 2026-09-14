@@ -1,6 +1,8 @@
-# Workspace-level cargo configuration.
-# A custom JSON target cannot use the precompiled sysroot core, so we build
-# core + compiler_builtins from source (requires nightly + rust-src component).
+[build]
+target = "aarch64-unknown-none"
 
-[unstable]
-build-std = ["core", "compiler_builtins", "alloc"]
+# Bare-metal AArch64 convention: forbid implicit unaligned accesses (the
+# Rust Embedded book recommendation for this target; `strict-align` was
+# renamed to the negated `unaligned-scalar-mem` in newer rustc).
+[target.aarch64-unknown-none]
+rustflags = ["-C", "target-feature=-unaligned-scalar-mem"]

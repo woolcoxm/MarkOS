@@ -1,35 +1,42 @@
 # MarkOS
 
-A single-purpose **x86_64 unikernel** that boots directly into an LLM inference
-engine. No scheduler, no processes, no filesystem beyond raw block reads for
-model weights. Every design decision serves one goal: load a model and run
-inference on it as fast as possible.
+A **bare-metal Raspberry Pi appliance for local LLM inference**. No Linux, no
+distro, no shell: flash the SD card, power on, and the Pi boots straight into
+a minimal inference engine that serves a GGUF model over the network. The
+configuration is frozen at install time (the `markos-installer` bakes it into
+the image); at runtime the system is controlled only through its own
+LLM/control protocol.
 
-Built from scratch in `#![no_std]` Rust on the Limine boot protocol, following
-a phased plan (Phase 0 … Phase 11) with a QEMU-verified acceptance criterion
-per phase.
+Design rule for every decision: *does this make the model run faster or the
+appliance simpler?* If not, it does not exist.
 
-## Pinned toolchain (reproduce with these)
+## Why this is different
 
-| Component        | Version                            |
-|------------------|------------------------------------|
-| Limine bootloader| **v12.9.0** (binary release tarball, `make deps`) |
-| `limine` crate   | 0.6.5 (boot protocol interface)    |
-| Rust             | nightly (built & tested with 1.100.0-nightly), components: `rust-src`, `llvm-tools-preview` |
-| Dev loop         | WSL2 Ubuntu 24.04, QEMU 8.2.2 (TCG), xorriso 1.5.6, GNU make |
+- **Boots to inference in seconds** — no bootloader chain, no init system.
+- **Zero OS overhead** — no scheduler jitter, no syscalls, no page-cache
+  surprises; every core does tensor math or nothing.
+- **Hard real-time memory policy** — no swap ever; the model either fits or
+  the installer refuses to build the image.
+- **Optional accelerator**: M5Stack LLM8850 (Axera AX8850, 24 TOPS, 8 GB) on
+  the Pi 5's M.2 slot, driven as a PCIe inference appliance.
 
-## Layout
+## Target hardware
+
+| Board | Status |
+|-------|--------|
+| QEMU raspi3b | dev/CI loop (automated tests) |
+| Raspberry Pi 4 (BCM2711) | bring-up target — best-documented bare-metal Pi |
+| Raspberry Pi 5 (BCM2712) | performance target — A76 + UDOT, M.2 for LLM8850 |
+
+## Repository layout
 
 ```
-kernel/                 the kernel crate (no_std, no_main)
-  src/main.rs           entry point, Limine request table
-  src/serial.rs         COM1 serial console
-  linker.ld             higher-half linker script (requests get their own PHDR)
-target/x86_64-unikernel.json   custom target spec (panic=abort, no red zone,
-                               mcmodel=kernel, soft-float for now)
-boot/limine.conf        Limine menu config
-Makefile                build → image → run, all inside WSL
-third_party/limine      vendored by `make deps`, gitignored
+kernel/                the kernel crate (no_std, no_main, AArch64)
+  src/main.rs          entry stub (park APs, stack, FP/NEON, zero bss) + kmain
+  src/uart.rs          PL011 serial console
+  aarch64.ld           flat physical layout at 0x80000 (Pi 64-bit load addr)
+sd/config.txt          Pi firmware boot config for real hardware
+Makefile               build → image → QEMU dev loop
 ```
 
 ## Building and running (from Windows, via WSL)
@@ -38,27 +45,30 @@ third_party/limine      vendored by `make deps`, gitignored
 wsl bash -lc 'cd /mnt/c/Users/Mark/Desktop/Projects/MarkOS && make run-log'
 ```
 
-`make deps` first on a fresh checkout. `make run` attaches the serial console
-to the terminal; `make debug` starts QEMU paused with a GDB stub on :1234.
+The automated dev loop runs the image in QEMU (`-M raspi3b`). For real
+hardware: copy `kernel8.img` + `sd/config.txt` + the stock Pi firmware blobs
+onto a FAT32 SD card and boot; the serial console (GPIO 14/15, 115200) is the
+system console.
 
-## Phase status
+## Roadmap (Pi-first)
 
-- [x] Phase 0 — scaffold: boots in QEMU, prints `kernel alive` on COM1, halts
-- [x] Phase 1 — GDT, IDT, TSS, exception handlers, panic register dump
-- [x] Phase 2 — physical frame allocator (bitmap)
-- [x] Phase 3 — page tables + kernel heap
-- [ ] Phase 4 — SMP bring-up (ACPI MADT, INIT-SIPI-SIPI)
-- [ ] Phase 5 — work-stealing thread-per-core pool
-- [ ] Phase 6 — huge pages, NUMA-aware weight placement
-- [ ] Phase 7 — virtio-blk + GGUF parsing
-- [ ] Phase 8 — quantized CPU matmul kernels (AVX2/AVX-512)
-- [ ] Phase 9 — virtio-net + minimal TCP/IP + token streaming protocol
-- [ ] Phase 10 — serial stats (tok/s, memory, per-core util)
-- [ ] Phase 11 — 24 h soak test
-- [ ] (optional, separate track) GPU compute — explicit decision required first
+- [x] Pi-0 — AArch64 bring-up: boots in QEMU raspi3b, `kernel alive` on PL011
+- [ ] Pi-1 — MMU page tables, exception vectors (VBAR), generic timer
+- [ ] Pi-2 — GIC-400, SMP: all cores online, shared-counter acceptance
+- [ ] Pi-3 — SD card driver (SDHCI) + minimal FAT reader + GGUF load
+- [ ] Pi-4 — NEON int8 matmul kernels (UDOT), work-stealing pool, 2 MiB blocks
+- [ ] Pi-5 — Network: GENET (Pi 4) / Pi 5 path, minimal TCP, inference+control protocol
+- [ ] Pi-6 — Installer: host tool bakes config (IP, port, admin token, model) into SD image
+- [ ] Pi-7 — LLM8850 on Pi 5: PCIe/RP1 enumeration + Axera card transport (research-gated)
+- [ ] Pi-8 — stats + soak test; real-hardware validation
+
+An earlier x86_64 exploration (Limine unikernel, phases 0–3) is preserved on
+the `x86_64-archive` branch for reference; the Pi is now the only target.
 
 ## Scope notes (hard boundaries)
 
-No multi-tenancy, no general scheduler, no POSIX, no real filesystem, no GUI.
-GPU support is an explicitly separate later track (VFIO shim vs. NVK port) and
-is *not* part of the base build. See the project brief for the rationale.
+No multi-tenancy, no general scheduler, no POSIX, no shell, no runtime
+configuration outside the LLM/control protocol. NPU/GPU acceleration (LLM8850)
+is a separate, research-gated track — vendor stacks assume Linux, so bare-metal
+support means reimplementing their transport from documentation and GPL
+drivers, decided explicitly before any work starts.
