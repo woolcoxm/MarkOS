@@ -49,34 +49,24 @@ Scope discipline: ~40 calls, no codec/native API, no PPL, single device,
 single stream to start. The whole-layer decode loop uses exactly this
 surface (proven in the RE repo; nothing else is load-bearing).
 
-## The critical path: the PCIe transport
+## The transport: known, not reverse-engineered
 
-`libaxcl.so` + `axcl_host.ko` are closed binaries; the wire protocol (BAR
-register map, command framing, DMA descriptors/rings, CMM allocator
-protocol) is undocumented anywhere. Reimplementing it is static
-reverse-engineering work — no hardware required to read the binaries:
-
-1. **Artifact collection**: `axclhost` package from the M5Stack apt pool
-   (`repo.llm.m5stack.com`) — kernel modules + `libaxcl*.so` + headers.
-   The RE repo's `driver-good/` backup is the matched pair to document.
-2. **Kernel-module RE**: `ax_pcie_host_dev.ko` / `axcl_host.ko` — file
-   ops + ioctl table, BAR map, DMA descriptor format, interrupt path,
-   mailbox/doorbell semantics. objdump + decompiler; card-side log strings
-   (axcl runtime prints) as anchors.
-3. **Userspace-lib RE**: `libaxcl_rt.so` — how each axclrt* call frames
-   into kernel ioctls / ring commands; the CMM allocator's bookkeeping.
-4. **Cross-check**: the RE repo's `vendor_trace.c` (LD_PRELOAD tracer)
-   captures the vendor runtime's API-level IO on Linux; on-hardware PCIe
-   captures (later, on the user's rig) validate the reconstructed
-   protocol before MarkOS ever talks to the card.
+The M5Stack `axclhost` package is DKMS — it **ships the kernel-driver
+source**. The PCIe transport (BAR map, handshake, kfifo rings, mailbox
+doorbells, CMM allocator ioctls) is documented from that source in
+[docs/axcl-transport.md](docs/axcl-transport.md). The only closed piece
+remaining is the *command payload* layer inside `libaxcl_rt.so` — and
+frames are visible at the open kernel boundary, so a printk patch on the
+rig while running `axcl_run_model` dumps the command set. What was scoped
+as binary RE is now: read open source + capture command frames.
 
 ## Phases
 
 | Phase | Work | Needs hardware? |
 |---|---|---|
-| Pi-7b-0 | artifact collection, symbol/ioctl inventory, RE tooling | no |
-| Pi-7b-1 | transport RE: BAR map, command framing, DMA rings → `docs/axcl-transport.md` | no |
-| Pi-7b-2 | MarkOS: BCM2712 PCIe RC bring-up (ECAM base confirm, link train, AX8850 0650 visible via our pcie.rs) | yes (Pi 5 + card) |
+| Pi-7b-0 | artifact collection (axclhost 3.6.5-m5stack1 .deb, sha256-verified) — **done** | no |
+| Pi-7b-1 | transport doc from driver source (handshake/rings/mailbox/mmb) — **done**, see [axcl-transport.md](axcl-transport.md); command-frame capture pending rig access | no |
+| Pi-7b-2 | MarkOS: BCM2712 PCIe RC bring-up (ECAM base confirm, link train, AX8850 `1f4b:0650` visible via our pcie.rs), handshake + rings in bare metal | yes (Pi 5 + card) |
 | Pi-7b-3 | transport MVP: device init → malloc → upload one .axmodel → LoadFromMem → one Execute with IO bindings; compare vs golden IO from the RE repo's `engine_dump.c` harness | yes |
 | Pi-7b-4 | whole-model decode (28+1 engines, hidden ping-pong, KV/mask bindings) — first tokens bare-metal | yes |
 | Pi-7b-5 | performance parity: async chain (one sync after layer 27), pinned staging DMA, deferred KV write-back, chunked-prefill ladder | yes |
