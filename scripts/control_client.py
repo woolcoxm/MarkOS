@@ -34,6 +34,8 @@ def main():
     ok &= o
     o, r = cmd("STATUS", "OK state=")
     ok &= o
+    o, r = cmd("STATS", "OK stats uptime_ms=")
+    ok &= o and "cores=" in r and "served=" in r
     o, r = cmd("LOAD", "OK loaded bytes=")
     ok &= o and "tensors=" in r
     o, r = cmd("RUN", "OK run")

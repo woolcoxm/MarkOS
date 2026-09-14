@@ -110,6 +110,7 @@ pub fn dispatch(payload: &[u8], out: &mut [u8]) -> usize {
             let _ = fmt::write(&mut w, format_args!("ERR auth"));
         }
         b"STATUS" => status(&mut w),
+        b"STATS" => stats(&mut w),
         b"LOAD" => load(&mut w),
         b"RUN" => run(&mut w),
         b"PING" => {
@@ -151,6 +152,21 @@ fn status(w: &mut BufW) {
         format_args!(
             "OK state={state} bytes={bytes} tensors={tensors} uptime_ms={} served={served}",
             timer::uptime_ms()
+        ),
+    );
+}
+
+/// Observability (brief Phase 10): live health counters for a monitoring
+/// client — uptime, command count, model state, timer tick rate, cores.
+fn stats(w: &mut BufW) {
+    let (bytes, served) = unsafe { (MODEL_BYTES, SERVED) };
+    let _ = fmt::write(
+        w,
+        format_args!(
+            "OK stats uptime_ms={} tick_hz={} served={served} model_bytes={bytes} cores={}",
+            timer::uptime_ms(),
+            timer::frequency(),
+            board::CORE_COUNT
         ),
     );
 }
