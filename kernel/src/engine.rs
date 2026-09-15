@@ -1186,6 +1186,9 @@ static mut PJ_SX: f32 = 0.0;
 static mut PJ_DOTPROD: bool = false;
 static mut PJ_Y_PTR: usize = 0;
 static mut PJ_XQ_PTR: usize = 0;
+static mut XQ_BUF: [u8; MAX_DIM] = [0; MAX_DIM];
+static mut XS_BUF: [f32; MAX_DIM / 32] = [0.0; MAX_DIM / 32];
+static mut PJ_XS_PTR: usize = 0;
 
 /// Pool job: compute rows [core_id*rp, (core_id+1)*rp) of the output.
 /// Reads weight rows from the RAM cache window, does SDOT per-block dots
@@ -1201,9 +1204,9 @@ fn psdot_pool_job(core_id: usize, _arg: u64) {
     let rows_per = PJ_N_OUT / n_cores;
     let start = core_id * rows_per;
     let n_blk = PJ_N_BLK;
-    let sx = PJ_SX;
     let dotprod = PJ_DOTPROD;
     let xq = PJ_XQ_PTR as *const u8;
+    let xs = PJ_XS_PTR as *const f32;
     let wbase = PJ_ROW_BASE;
     let stride = PJ_ROW_STRIDE;
     let y = PJ_Y_PTR as *mut f32;
@@ -1233,7 +1236,10 @@ fn psdot_pool_job(core_id: usize, _arg: u64) {
                     dot += (w as i8) as f32 * (xv as f32);
                 }
             }
-            acc_f += dot * sb * sx;
+            let sxb = f32::from_bits(unsafe {
+                core::ptr::read((PJ_XS_PTR as usize + b * 4) as *const u32)
+            });
+            acc_f += dot * sb * sxb;
         }
         y.add(r).write(acc_f);
     }
@@ -1248,35 +1254,41 @@ fn matvec_udot(
     x: &[f32],
     y: &mut [f32],
 ) -> Result<(), &'static str> {
-    static mut XQ: [u8; MAX_DIM] = [0; MAX_DIM];
+    static mut XS: [f32; MAX_DIM / 32] = [0.0; MAX_DIM / 32];
 
-    let mut max = 0f32;
-    for v in x.iter() {
-        let a = if *v < 0.0 { -*v } else { *v };
-        if a > max {
-            max = a;
+    // Per-block activation quantization (Q8_1-style): each 32-element
+    // block gets its own symmetric scale (blockmax/127), preserving
+    // precision across the activation dynamic range.
+    let n_blk = n_in / 32;
+    for b in 0..n_blk {
+        let mut bmax = 0f32;
+        for j in 0..32 {
+            let v = x[b * 32 + j];
+            let a = if v < 0.0 { -v } else { v };
+            if a > bmax {
+                bmax = a;
+            }
         }
-    }
-    let sx = if max > 0.0 { max / 127.0 } else { 1.0 };
-    // Soundness: XQ is engine scratch on the BSP; activations quantize
-    // once and are read by every row dot.
-    let xq = unsafe {
-        core::slice::from_raw_parts_mut((&raw mut XQ) as *mut u8, MAX_DIM)
-    };
-    for (i, v) in x.iter().enumerate() {
-        let q = round_i32(v / sx).clamp(-127, 127);
-        xq[i] = (q as i8) as u8;
+        let bs = if bmax > 0.0 { bmax / 127.0 } else { 1.0 };
+        unsafe { XS[b] = bs; }
+        for j in 0..32 {
+            let q = round_i32(x[b * 32 + j] / bs).clamp(-127, 127);
+            unsafe { XQ_BUF[b * 32 + j] = (q as i8) as u8; }
+        }
     }
 
     // Pool-parallel: each core computes its share of rows. The quantized
     // activations (XQ) are cleaned so the MMU-off APs can read them; y is
     // invalidated after so the BSP reads the APs' uncached writes.
     let row_bytes = n_in / 32 * 34;
-    let n_blk = n_in / 32;
     let dotprod = cpu::has_dotprod();
 
-    // Clean XQ so the MMU-off AP cores see the BSP's quantized writes.
-    cache::clean_range(xq.as_ptr() as usize, n_in);
+    // Clean XQ + per-block scales so the MMU-off AP cores see them.
+    cache::clean_range(unsafe { (&raw const XQ_BUF) as usize }, n_in);
+    cache::clean_range(
+        unsafe { (&raw const XS_BUF) as usize },
+        n_blk * core::mem::size_of::<f32>(),
+    );
     // Clean the descriptor statics too — on real A76 hardware the BSP's
     // cached writes must reach RAM before the MMU-off APs read them.
     cache::clean_range(
@@ -1290,10 +1302,10 @@ fn matvec_udot(
         PJ_ROW_STRIDE = row_bytes;
         PJ_N_BLK = n_blk;
         PJ_N_OUT = n_out;
-        PJ_SX = sx;
         PJ_DOTPROD = dotprod;
         PJ_Y_PTR = y.as_mut_ptr() as usize;
-        PJ_XQ_PTR = xq.as_ptr() as usize;
+        PJ_XQ_PTR = (&raw const XQ_BUF) as usize;
+        PJ_XS_PTR = (&raw const XS_BUF) as usize;
     }
 
     pool::run_on_all(psdot_pool_job, 0, board::CORE_COUNT);
@@ -1304,6 +1316,8 @@ fn matvec_udot(
 
     Ok(())
 }
+
+
 
 /// Per-token hidden states for batched prefill (up to 8 tokens).
 /// Soundness: BSP-only scratch; the pool cores don't touch this buffer.
