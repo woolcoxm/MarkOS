@@ -1172,6 +1172,73 @@ unsafe fn sdot_block(qp: *const u8, xp: *const u8) -> i32 {
 /// Serving-path fast matvec: quantizes x once (one symmetric scale), then
 /// SDOT row dots from the weight source, applying per-block q8_0 scales.
 /// Requires ram_weights + has_dotprod (checked by the caller).
+
+
+// ===== Pool job statics for parallel SDOT matvec =====
+// Soundness: written by the BSP before run_on_all and cleaned; read by
+// all cores via the identity map (MMU-off APs access physical directly).
+
+static mut PJ_ROW_BASE: u64 = 0;
+static mut PJ_ROW_STRIDE: usize = 0;
+static mut PJ_N_BLK: usize = 0;
+static mut PJ_N_OUT: usize = 0;
+static mut PJ_SX: f32 = 0.0;
+static mut PJ_DOTPROD: bool = false;
+static mut PJ_Y_PTR: usize = 0;
+static mut PJ_XQ_PTR: usize = 0;
+
+/// Pool job: compute rows [core_id*rp, (core_id+1)*rp) of the output.
+/// Reads weight rows from the RAM cache window, does SDOT per-block dots
+/// with per-block f16 scales, writes results to y.
+/// Soundness: pure NEON math on in-bounds rows of the RAM cache; y writes
+/// are disjoint per core; XQ is read-only shared (cleaned by the BSP).
+fn psdot_pool_job(core_id: usize, _arg: u64) {
+    // Soundness: the descriptor statics and shared buffers are written by
+    // the BSP before run_on_all and cleaned; the y writes are disjoint
+    // per core. All static accesses are wrapped in unsafe blocks below.
+    unsafe {
+    let n_cores = board::CORE_COUNT;
+    let rows_per = PJ_N_OUT / n_cores;
+    let start = core_id * rows_per;
+    let n_blk = PJ_N_BLK;
+    let sx = PJ_SX;
+    let dotprod = PJ_DOTPROD;
+    let xq = PJ_XQ_PTR as *const u8;
+    let wbase = PJ_ROW_BASE;
+    let stride = PJ_ROW_STRIDE;
+    let y = PJ_Y_PTR as *mut f32;
+
+    for r in start..(start + rows_per) {
+        let row_base = wbase + (r as u64) * stride as u64;
+        let mut acc_f = 0f32;
+        for b in 0..n_blk {
+            let boff = b * 34;
+            let sb = f16_to_f32(u16::from_le_bytes(
+                core::ptr::read((row_base as usize + boff) as *const [u8; 2]),
+            ));
+            let mut dot = 0f32;
+            if dotprod {
+                // Soundness: sdot_block is pure NEON math on in-bounds
+                // blocks of the cached row and the quantized activations.
+                unsafe {
+                    dot = sdot_block(
+                        (row_base as usize + boff + 2) as *const u8,
+                        (xq as usize + b * 32) as *const u8,
+                    ) as f32;
+                }
+            } else {
+                for j in 0..32 {
+                    let w = core::ptr::read((row_base as usize + boff + 2 + j) as *const u8);
+                    let xv = core::ptr::read((xq as usize + b * 32 + j) as *const u8);
+                    dot += (w as i8) as f32 * (xv as f32);
+                }
+            }
+            acc_f += dot * sb * sx;
+        }
+        y.add(r).write(acc_f);
+    }
+    } // unsafe: end of psdot_pool_job body
+}
 fn matvec_udot(
     vol: &FatVolume,
     file: &File,
@@ -1201,42 +1268,33 @@ fn matvec_udot(
         xq[i] = (q as i8) as u8;
     }
 
+    // Pool-parallel: each core computes its share of rows. The quantized
+    // activations (XQ) are cleaned so the MMU-off APs can read them; y is
+    // invalidated after so the BSP reads the APs' uncached writes.
     let row_bytes = n_in / 32 * 34;
     let n_blk = n_in / 32;
     let dotprod = cpu::has_dotprod();
-    let mut row = [0u8; MAX_DIM / 32 * 34];
-    for r in 0..n_out {
-        wread(
-            vol,
-            file,
-            abs + (r as u64) * row_bytes as u64,
-            row_bytes,
-            &mut row[..row_bytes],
-        )?;
-        let mut acc_f = 0f32;
-        for b in 0..n_blk {
-            let boff = b * 34;
-            let sb = f16_to_f32(u16::from_le_bytes([row[boff], row[boff + 1]]));
-            let mut dot = 0f32;
-            let xoff = b * 32; // activation blocks are dense (32 bytes each)
-            if dotprod {
-                // Soundness: sdot_block is pure NEON math on in-bounds
-                // blocks of the cached row and the quantized activations.
-                unsafe {
-                    dot = sdot_block(
-                        row.as_ptr().add(boff + 2),
-                        xq.as_ptr().add(xoff),
-                    ) as f32;
-                }
-            } else {
-                for j in 0..32 {
-                    dot += ((row[boff + 2 + j] as i8) as f32)
-                        * (xq[xoff + j] as f32);
-                }
-            }
-            acc_f += dot * sb * sx;
-        }
-        y[r] = acc_f;
+
+    // Clean XQ so the MMU-off AP cores see the BSP's quantized writes.
+    cache::clean_range(xq.as_ptr() as usize, n_in);
+
+    // Set up the pool job descriptor.
+    unsafe {
+        PJ_ROW_BASE = board::WEIGHT_RAM_BASE as u64 + abs;
+        PJ_ROW_STRIDE = row_bytes;
+        PJ_N_BLK = n_blk;
+        PJ_N_OUT = n_out;
+        PJ_SX = sx;
+        PJ_DOTPROD = dotprod;
+        PJ_Y_PTR = y.as_mut_ptr() as usize;
+        PJ_XQ_PTR = xq.as_ptr() as usize;
     }
+
+    pool::run_on_all(psdot_pool_job, 0, board::CORE_COUNT);
+
+    // The APs wrote y with MMU off (uncached, straight to RAM): drop the
+    // BSP's cached copies so it reads the combined results.
+    cache::invalidate_range(y.as_mut_ptr() as usize, n_out * 4);
+
     Ok(())
 }
