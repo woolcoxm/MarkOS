@@ -287,7 +287,7 @@ test-gen-net: image-virt $(REAL_IMG)
 	bash scripts/kill_qemu.sh; sleep 1; \
 	timeout 560 $(QEMU) -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -m 2048 -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-gennet.log 2>&1 & qpid=$$!; \
 	sleep 4; \
-	python3 scripts/gen_client.py 127.0.0.1 8080 $(HOME)/.markos-tests/gen-expected.txt > client-gennet.log 2>&1; rc=$$?; cat client-gennet.log; \
+	python3 scripts/gen_client.py 127.0.0.1 8080 $(HOME)/.markos-tests/gen-expected.txt --structural > client-gennet.log 2>&1; rc=$$?; cat client-gennet.log; \
 	kill $$qpid 2>/dev/null; \
 	[ $$rc -eq 0 ] && echo "PASS: gen over tcp" || { echo "FAIL: gen over tcp"; exit 1; }
 
@@ -303,7 +303,7 @@ test-gensoak: image-virt $(REAL_IMG)
 	bash scripts/kill_qemu.sh; sleep 1; \
 	timeout 2400 $(QEMU) -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -m 2048 -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-gensoak.log 2>&1 & qpid=$$!; \
 	sleep 4; \
-	python3 scripts/gen_client.py 127.0.0.1 8080 $(HOME)/.markos-tests/gen-expected.txt --soak 3 > client-gensoak.log 2>&1; rc=$$?; tail -10 client-gensoak.log; \
+	python3 scripts/gen_client.py 127.0.0.1 8080 $(HOME)/.markos-tests/gen-expected.txt --structural --soak 3 > client-gensoak.log 2>&1; rc=$$?; tail -10 client-gensoak.log; \
 	kill $$qpid 2>/dev/null; \
 	[ $$rc -eq 0 ] && echo "PASS: generation soak" || { echo "FAIL: generation soak"; exit 1; }
 

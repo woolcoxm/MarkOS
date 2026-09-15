@@ -592,6 +592,48 @@ pub fn gen_stream(payload: &[u8]) {
             "AB serial={s1:.6e} par={s2:.6e} v0={:.6e}/{:.6e}\n",
             y1[0], y2[0]
         ));
+        // SDOT-vs-scalar row check on row 0 of attn_q.
+        {
+            let row_bytes = n_in / 32 * 34;
+            let n_blk = n_in / 32;
+            let mut row = [0u8; 2048];
+            let mut sb = [0u8; 2];
+            let _ = vol.read_at(&file, qabs, &mut sb);
+            let srow = engine::f16_to_f32(u16::from_le_bytes([sb[0], sb[1]]));
+            let _ = vol.read_at(&file, qabs, &mut row[..row_bytes]);
+            let mut xq = [0i8; 1024];
+            let mut sx = 1f32;
+            for (i, v) in xa.iter().enumerate() {
+                let a = if *v < 0.0 { -*v } else { *v };
+                if a > sx {
+                    sx = a;
+                }
+            }
+            sx /= 127.0;
+            for (i, v) in xa.iter().enumerate() {
+                let r = v / sx;
+                let q = (r + if r >= 0.0 { 0.5 } else { -0.5 }) as i32;
+                xq[i] = q.clamp(-127, 127) as i8;
+            }
+            let mut sdot_sum = 0f32;
+            let mut scal_sum = 0f32;
+            for b in 0..n_blk {
+                let boff = b * 34;
+                let sb16 = u16::from_le_bytes([row[boff], row[boff + 1]]);
+                let sbf = engine::f16_to_f32(sb16);
+                let mut d = 0i32;
+                for j in 0..32 {
+                    d += (row[boff + 2 + j] as i8) as i32 * xq[b * 32 + j] as i32;
+                }
+                sdot_sum += sbf * (d as f32);
+                for j in 0..32 {
+                    scal_sum += xa[b * 32 + j] * sbf * ((row[boff + 2 + j] as i8) as f32);
+                }
+            }
+            uart::locked_write(format_args!(
+                "SDOTREF row0 sdot={sdot_sum:.6e} scal={scal_sum:.6e}\n"
+            ));
+        }
         uart::locked_write(format_args!(
             "AB bytes vol={:02x?} ram={:02x?} ramrow1={:02x?}\n",
             volb, ramb, rowb

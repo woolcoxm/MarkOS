@@ -14,6 +14,7 @@ use core::intrinsics::{roundf32, roundf64, sqrtf32, sqrtf64};
 
 use crate::board;
 use crate::cache;
+use crate::cpu;
 use crate::fat::{FatVolume, File};
 use crate::pool;
 
@@ -248,6 +249,11 @@ pub fn matvec_q8_0(
     x: &[f32],
     y: &mut [f32],
 ) -> Result<(), &'static str> {
+    // A76 fast path: quantized activations + SDOT int8 row dots, from the
+    // RAM weight cache when installed. Runtime-gated by cpu::has_dotprod.
+    if cpu::has_dotprod() && ram_weights() {
+        return matvec_udot(vol, file, abs, n_in, n_out, x, y);
+    }
     // RAM cache live: rows split across the pool cores.
     if ram_weights() && n_out % board::CORE_COUNT == 0 && n_out <= MAX_DIM {
         return matvec_q8_0_par(x, y, abs, n_in, n_out);
@@ -1127,5 +1133,109 @@ pub fn matvec_q8_0_par(x: &[f32], y: &mut [f32], abs: u64, n_in: usize, n_out: u
     // core's result from memory.
     cache::clean_range(y.as_ptr() as usize, n_out * 4);
     cache::invalidate_range(y.as_ptr() as usize, n_out * 4);
+    Ok(())
+}
+
+/// Round-half-away f32 -> i32 without libm.
+fn round_i32(v: f32) -> i32 {
+    let a = if v >= 0.0 { v + 0.5 } else { v - 0.5 };
+    a as i32
+}
+
+/// SDOT: signed int8 dot of one 32-byte block (two 16B halves) into 4
+/// i32 lanes, pairwise-reduced to a scalar.
+/// Soundness: pure NEON math on in-bounds block pointers; dotprod is
+/// per-function and runtime-gated by cpu::has_dotprod.
+#[target_feature(enable = "dotprod")]
+unsafe fn sdot_block(qp: *const u8, xp: *const u8) -> i32 {
+    let mut lanes = [0i32; 4];
+    core::arch::asm!(
+        "movi v17.4s, #0",
+        "ld1 {{v18.16b}}, [{qp}], #16",
+        "ld1 {{v19.16b}}, [{xp}], #16",
+        "sdot v17.4s, v18.16b, v19.16b",
+        "ld1 {{v18.16b}}, [{qp}], #16",
+        "ld1 {{v19.16b}}, [{xp}], #16",
+        "sdot v17.4s, v18.16b, v19.16b",
+        "addp v17.4s, v17.4s, v17.4s",
+        "addp v17.4s, v17.4s, v17.4s",
+        "st1 {{v17.4s}}, [{outp}]",
+        qp = inout(reg) qp => _,
+        xp = inout(reg) xp => _,
+        outp = in(reg) lanes.as_mut_ptr(),
+        lateout("v17") _, lateout("v18") _, lateout("v19") _,
+        options(nostack),
+    );
+    lanes[0]
+}
+
+/// Serving-path fast matvec: quantizes x once (one symmetric scale), then
+/// SDOT row dots from the weight source, applying per-block q8_0 scales.
+/// Requires ram_weights + has_dotprod (checked by the caller).
+fn matvec_udot(
+    vol: &FatVolume,
+    file: &File,
+    abs: u64,
+    n_in: usize,
+    n_out: usize,
+    x: &[f32],
+    y: &mut [f32],
+) -> Result<(), &'static str> {
+    static mut XQ: [u8; MAX_DIM] = [0; MAX_DIM];
+
+    let mut max = 0f32;
+    for v in x.iter() {
+        let a = if *v < 0.0 { -*v } else { *v };
+        if a > max {
+            max = a;
+        }
+    }
+    let sx = if max > 0.0 { max / 127.0 } else { 1.0 };
+    // Soundness: XQ is engine scratch on the BSP; activations quantize
+    // once and are read by every row dot.
+    let xq = unsafe {
+        core::slice::from_raw_parts_mut((&raw mut XQ) as *mut u8, MAX_DIM)
+    };
+    for (i, v) in x.iter().enumerate() {
+        let q = round_i32(v / sx).clamp(-127, 127);
+        xq[i] = (q as i8) as u8;
+    }
+
+    let row_bytes = n_in / 32 * 34;
+    let n_blk = n_in / 32;
+    let dotprod = cpu::has_dotprod();
+    let mut row = [0u8; MAX_DIM / 32 * 34];
+    for r in 0..n_out {
+        wread(
+            vol,
+            file,
+            abs + (r as u64) * row_bytes as u64,
+            row_bytes,
+            &mut row[..row_bytes],
+        )?;
+        let mut acc_f = 0f32;
+        for b in 0..n_blk {
+            let boff = b * 34;
+            let sb = f16_to_f32(u16::from_le_bytes([row[boff], row[boff + 1]]));
+            let mut dot = 0f32;
+            if dotprod {
+                // Soundness: sdot_block is pure NEON math on in-bounds
+                // blocks of the cached row and the quantized activations.
+                unsafe {
+                    dot = sdot_block(
+                        row.as_ptr().add(boff + 2),
+                        xq.as_ptr().add(boff),
+                    ) as f32;
+                }
+            } else {
+                for j in 0..32 {
+                    dot += ((row[boff + 2 + j] as i8) as f32)
+                        * (xq[boff + j] as f32);
+                }
+            }
+            acc_f += dot * sb * sx;
+        }
+        y[r] = acc_f;
+    }
     Ok(())
 }
