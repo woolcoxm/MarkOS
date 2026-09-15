@@ -12,7 +12,10 @@
 
 use core::intrinsics::{roundf32, roundf64, sqrtf32, sqrtf64};
 
+use crate::board;
+use crate::cache;
 use crate::fat::{FatVolume, File};
+use crate::pool;
 
 // Soundness: the intrinsics below are the hardware round/sqrt operations —
 // pure math, no memory effects; core does not expose them on this target.
@@ -196,7 +199,7 @@ pub fn dequant_q8_0_row(
     let chunk = unsafe {
         core::slice::from_raw_parts_mut((&raw mut W_CHUNK) as *mut u8, W_CHUNK_LEN)
     };
-    vol.read_at(file, abs, &mut chunk[..row_bytes])?;
+    wread(vol, file, abs, row_bytes, &mut chunk[..row_bytes])?;
     for b in 0..n / 32 {
         let s = f16_to_f32(u16::from_le_bytes([chunk[b * 34], chunk[b * 34 + 1]]));
         for j in 0..32 {
@@ -221,7 +224,7 @@ pub fn read_f32_vec(
     let chunk = unsafe {
         core::slice::from_raw_parts_mut((&raw mut W_CHUNK) as *mut u8, W_CHUNK_LEN)
     };
-    vol.read_at(file, abs, &mut chunk[..row_bytes])?;
+    wread(vol, file, abs, row_bytes, &mut chunk[..row_bytes])?;
     for i in 0..n {
         out[i] = f32::from_le_bytes([
             chunk[i * 4],
@@ -244,6 +247,10 @@ pub fn matvec_q8_0(
     x: &[f32],
     y: &mut [f32],
 ) -> Result<(), &'static str> {
+    // RAM cache live: rows split across the pool cores.
+    if ram_weights() && n_out % board::CORE_COUNT == 0 && n_out <= MAX_DIM {
+        return matvec_q8_0_par(x, y, abs, n_in, n_out);
+    }
     let row_bytes = n_in / 32 * 34;
     if row_bytes == 0 || row_bytes > W_CHUNK_LEN {
         return Err("matvec: row too large");
@@ -258,9 +265,11 @@ pub fn matvec_q8_0(
     let mut done = 0usize;
     while done < n_out {
         let rows = chunk_rows.min(n_out - done);
-        vol.read_at(
+        wread(
+            vol,
             file,
             abs + (done as u64) * row_bytes as u64,
+            rows * row_bytes,
             &mut chunk[..rows * row_bytes],
         )?;
         for r in 0..rows {
@@ -992,4 +1001,118 @@ pub fn detok(data: &[u8], id: u32, out: &mut [u8]) -> Option<usize> {
         j += used;
     }
     Some(n)
+}
+
+// ===== RAM weight cache + parallel matvec (perf phase) =====
+//
+// Weights stream from the volume once into a fixed RAM window at LOAD;
+// every matvec afterwards reads from RAM, and the row range is split
+// across the pool cores. Requires board::WEIGHT_RAM_SIZE > 0.
+
+static mut RAM_WEIGHTS: bool = false;
+
+pub fn set_ram_weights(on: bool) {
+    unsafe {
+        RAM_WEIGHTS = on;
+    }
+}
+
+pub fn ram_weights() -> bool {
+    unsafe { RAM_WEIGHTS }
+}
+
+/// Weight read: from the RAM cache when installed, else from the volume.
+/// Soundness: the cache is a fixed window sized >= the model file at
+/// LOAD; reads here are within [0, file_size).
+pub fn wread(
+    vol: &FatVolume,
+    file: &File,
+    abs: u64,
+    len: usize,
+    dst: &mut [u8],
+) -> Result<(), &'static str> {
+    if unsafe { RAM_WEIGHTS } && board::WEIGHT_RAM_SIZE > 0 {
+        if abs as usize + len > board::WEIGHT_RAM_SIZE {
+            return Err("wread: outside cache");
+        }
+        let src = unsafe {
+            core::slice::from_raw_parts(
+                (board::WEIGHT_RAM_BASE + abs as usize) as *const u8,
+                len,
+            )
+        };
+        dst[..len].copy_from_slice(src);
+        Ok(())
+    } else {
+        vol.read_at(file, abs, dst).map(|_| ())
+    }
+}
+
+/// Parallel matvec descriptor: one contiguous q8_0 matrix in the RAM
+/// cache times one shared x vector, rows split across the pool cores.
+static mut MV_ABS: u64 = 0;
+static mut MV_N_IN: usize = 0;
+static mut MV_ROWS_PER: usize = 0;
+static mut MV_ROWS_LAST: usize = 0;
+static mut MV_X: *const f32 = core::ptr::null();
+static mut MV_Y: *const f32 = core::ptr::null();
+static mut MV_BARRIER: u32 = 0;
+
+fn mv_job(core_id: usize, _arg: u64) {
+    let n_out = unsafe { MV_ROWS_PER };
+    let abs = unsafe { MV_ABS } as usize;
+    let n_in = unsafe { MV_N_IN };
+    let row_bytes = n_in / 32 * 34;
+    let n_blk = n_in / 32;
+    // Soundness: disjoint row ranges per core; x/y point at engine
+    // statics; the cache-maintenance in matvec_par makes BSP writes
+    // visible to MMU-off cores and flushes core writes back for the BSP.
+    for r in 0..n_out {
+        let row = core_id * n_out + r;
+        let base = board::WEIGHT_RAM_BASE + abs + row * row_bytes;
+        let mut acc = 0f32;
+        for b in 0..n_blk {
+            let blk = unsafe {
+                core::slice::from_raw_parts((base + b * 34) as *const u8, 34)
+            };
+            let s = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+            let xoff = b * 32;
+            for j in 0..32 {
+                acc += unsafe { *MV_X.add(xoff + j) } * s * ((blk[2 + j] as i8) as f32);
+            }
+        }
+        unsafe {
+            let yp = MV_Y as *mut f32;
+            *yp.add(row) = acc;
+        }
+    }
+    unsafe {
+        MV_BARRIER += 1;
+    }
+}
+
+/// RAM-cache matvec across all pool cores. Requires set_ram_weights(true).
+pub fn matvec_q8_0_par(x: &[f32], y: &mut [f32], abs: u64, n_in: usize, n_out: usize) -> Result<(), &'static str> {
+    if !ram_weights() || board::WEIGHT_RAM_SIZE == 0 {
+        return Err("par matvec: no ram cache");
+    }
+    if n_out % board::CORE_COUNT != 0 {
+        return Err("par matvec: rows not divisible by cores");
+    }
+    unsafe {
+        MV_ABS = abs;
+        MV_N_IN = n_in;
+        MV_ROWS_PER = n_out / board::CORE_COUNT;
+        MV_ROWS_LAST = 0;
+        MV_X = x.as_ptr();
+        MV_Y = y.as_ptr() as *const f32;
+        MV_BARRIER = 0;
+    }
+    // BSP writes x (cached): make it visible to the MMU-off cores.
+    cache::clean_range(x.as_ptr() as usize, n_in * 4);
+    pool::run_on_all(mv_job, 0, board::CORE_COUNT);
+    // Cores wrote y with the MMU off (uncached): drop the BSP's stale
+    // cached lines before it reads the results.
+    cache::invalidate_range(y.as_ptr() as usize, n_out * 4);
+    Ok(())
 }

@@ -252,10 +252,40 @@ fn load(w: &mut BufW) {
             MODEL_TENSORS = info.tensor_count;
             DATA_START = info.data_start;
         }
+        // Install the RAM weight cache: one sequential full-file read, then
+        // every matvec runs pool-parallel out of RAM.
+        let mut ram = 0u8;
+        if board::WEIGHT_RAM_SIZE >= file.size as usize {
+            let mut done = 0usize;
+            let chunk = 1024 * 1024;
+            let total = file.size as usize;
+            while done < total {
+                let n = chunk.min(total - done);
+                let dst = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        (board::WEIGHT_RAM_BASE + done) as *mut u8,
+                        n,
+                    )
+                };
+                if vol.read_at(&file, done as u64, dst).is_err() {
+                    let _ = fmt::write(w, format_args!("ERR cache fill"));
+                    return;
+                }
+                done += n;
+                if done % (128 * 1024 * 1024) == 0 {
+                    uart::locked_write(format_args!(
+                        "load: cache {} MiB\n",
+                        done / 1024 / 1024
+                    ));
+                }
+            }
+            engine::set_ram_weights(true);
+            ram = 1;
+        }
         let _ = fmt::write(
             w,
             format_args!(
-                "OK loaded bytes={} gguf=v{} tensors={} meta=1",
+                "OK loaded bytes={} gguf=v{} tensors={} meta=1 ram={ram}",
                 file.size, info.version, info.tensor_count
             ),
         );

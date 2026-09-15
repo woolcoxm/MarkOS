@@ -235,7 +235,7 @@ test-model: image-virt $(REAL_IMG)
 	$(MAKE) image-virt KERNEL_FEATURES=selftest-model
 	python3 scripts/gguf_ref.py $(MODEL_FILE) $(HOME)/.markos-tests/expected.txt
 	bash scripts/kill_qemu.sh; sleep 1; \
-	timeout 180 $(QEMU) $(VIRTFLAGS) -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 > serial-model.log 2>&1 || true; \
+	timeout 180 $(QEMU) $(VIRTFLAGS) -m 2048 -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 > serial-model.log 2>&1 || true; \
 	tr -d "\r" < serial-model.log | grep -E "^(model:|MT |MV )" > $(HOME)/.markos-tests/got.txt || true; \
 	tr -d "\r" < serial-model.log | grep -q "^PASS: model load" || { echo "FAIL: model load (no PASS marker)"; tail -5 serial-model.log; exit 1; }; \
 	diff $(HOME)/.markos-tests/expected.txt $(HOME)/.markos-tests/got.txt > $(HOME)/.markos-tests/model.diff && echo "PASS: model load" || { echo "FAIL: model load (expected vs got):"; head -10 $(HOME)/.markos-tests/model.diff; exit 1; }
@@ -248,7 +248,7 @@ test-forward: image-virt $(REAL_IMG)
 	$(MAKE) image-virt KERNEL_FEATURES=selftest-forward
 	python3 scripts/forward_ref.py $(MODEL_FILE) $(HOME)/.markos-tests/fwd-expected.txt
 	bash scripts/kill_qemu.sh; sleep 1; \
-	timeout 300 $(QEMU) $(VIRTFLAGS) -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 > serial-fwd.log 2>&1 || true; \
+	timeout 300 $(QEMU) $(VIRTFLAGS) -m 2048 -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 > serial-fwd.log 2>&1 || true; \
 	tr -d "\r" < serial-fwd.log | grep -E "^(TOKS|EMB|NRM|QK|ATT|MID|HID|PASS: forward)" > $(HOME)/.markos-tests/fwd-got.txt || true; \
 	tr -d "\r" < serial-fwd.log | grep -q "^PASS: forward" || { echo "FAIL: forward (no PASS marker)"; tail -5 serial-fwd.log; exit 1; }; \
 	python3 scripts/forward_check.py $(HOME)/.markos-tests/fwd-expected.txt $(HOME)/.markos-tests/fwd-got.txt && echo "PASS: forward pass" || { echo "FAIL: forward pass"; exit 1; }
@@ -259,7 +259,7 @@ test-gen: image-virt $(REAL_IMG)
 	$(MAKE) image-virt KERNEL_FEATURES=selftest-gen
 	python3 scripts/forward_ref.py $(MODEL_FILE) $(HOME)/.markos-tests/gen-expected.txt --gen 2
 	bash scripts/kill_qemu.sh; sleep 1; \
-	timeout 540 $(QEMU) $(VIRTFLAGS) -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 > serial-gen.log 2>&1 || true; \
+	timeout 540 $(QEMU) $(VIRTFLAGS) -m 2048 -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 > serial-gen.log 2>&1 || true; \
 	tr -d "\r" < serial-gen.log | grep -E "^(TOKS|LFIN|STEP|GEN|PASS: gen)" > $(HOME)/.markos-tests/gen-got.txt || true; \
 	tr -d "\r" < serial-gen.log | grep -q "^PASS: gen" || { echo "FAIL: gen (no PASS marker)"; tail -5 serial-gen.log; exit 1; }; \
 	python3 scripts/forward_check.py $(HOME)/.markos-tests/gen-expected.txt $(HOME)/.markos-tests/gen-got.txt && echo "PASS: generation" || { echo "FAIL: generation"; exit 1; }
@@ -285,7 +285,7 @@ test-gen-net: image-virt $(REAL_IMG)
 	$(MAKE) image-virt KERNEL_FEATURES=selftest-net
 	python3 scripts/forward_ref.py $(MODEL_FILE) $(HOME)/.markos-tests/gen-expected.txt --gen 2
 	bash scripts/kill_qemu.sh; sleep 1; \
-	timeout 560 $(QEMU) -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-gennet.log 2>&1 & qpid=$$!; \
+	timeout 560 $(QEMU) -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -m 2048 -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-gennet.log 2>&1 & qpid=$$!; \
 	sleep 4; \
 	python3 scripts/gen_client.py 127.0.0.1 8080 $(HOME)/.markos-tests/gen-expected.txt > client-gennet.log 2>&1; rc=$$?; cat client-gennet.log; \
 	kill $$qpid 2>/dev/null; \
@@ -301,7 +301,7 @@ test-gensoak: image-virt $(REAL_IMG)
 	$(MAKE) image-virt KERNEL_FEATURES=selftest-net
 	python3 scripts/forward_ref.py $(MODEL_FILE) $(HOME)/.markos-tests/gen-expected.txt --gen 2
 	bash scripts/kill_qemu.sh; sleep 1; \
-	timeout 2400 $(QEMU) -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-gensoak.log 2>&1 & qpid=$$!; \
+	timeout 2400 $(QEMU) -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -m 2048 -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-gensoak.log 2>&1 & qpid=$$!; \
 	sleep 4; \
 	python3 scripts/gen_client.py 127.0.0.1 8080 $(HOME)/.markos-tests/gen-expected.txt --soak 3 > client-gensoak.log 2>&1; rc=$$?; tail -10 client-gensoak.log; \
 	kill $$qpid 2>/dev/null; \

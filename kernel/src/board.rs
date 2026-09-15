@@ -23,6 +23,14 @@ pub const NAME: &str = "qemu-virt";
 /// `info mtree`: "pcie-ecam @ 0000004010000000-000000401fffffff").
 #[cfg(feature = "board-virt")]
 pub const PCIE_ECAM_BASE: usize = 0x0000_0040_1000_0000;
+/// RAM weight cache (Phase perf): QEMU virt booted with `-m 2048` has RAM
+/// [0x4000_0000, 0xC000_0000); the kernel + statics live in the first
+/// ~16 MiB, so a fixed window above 0x4800_0000 is free for the loaded
+/// model image. The identity map covers it (Normal, cacheable).
+#[cfg(feature = "board-virt")]
+pub const WEIGHT_RAM_BASE: usize = 0x4800_0000;
+#[cfg(feature = "board-virt")]
+pub const WEIGHT_RAM_SIZE: usize = 704 * 1024 * 1024;
 
 #[cfg(feature = "board-pi")]
 pub const UART_BASE: usize = 0x3F20_1000;
@@ -36,3 +44,10 @@ pub const NAME: &str = "raspi (pi3-qemu / pi4-pi5 hw)";
 /// guard skips building a mapping for it.
 #[cfg(feature = "board-pi")]
 pub const PCIE_ECAM_BASE: usize = 0x0000_1000_1200_0000;
+/// Pi 5 16GB: the weight cache lands in free DRAM above the kernel image —
+/// exact window defined at the Pi-8 hardware bring-up (the SD streaming
+/// path works without it meanwhile).
+#[cfg(feature = "board-pi")]
+pub const WEIGHT_RAM_BASE: usize = 0;
+#[cfg(feature = "board-pi")]
+pub const WEIGHT_RAM_SIZE: usize = 0;
