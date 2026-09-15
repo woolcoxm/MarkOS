@@ -44,10 +44,16 @@ pub const NAME: &str = "raspi (pi3-qemu / pi4-pi5 hw)";
 /// guard skips building a mapping for it.
 #[cfg(feature = "board-pi")]
 pub const PCIE_ECAM_BASE: usize = 0x0000_1000_1200_0000;
-/// Pi 5 16GB: the weight cache lands in free DRAM above the kernel image —
-/// exact window defined at the Pi-8 hardware bring-up (the SD streaming
-/// path works without it meanwhile).
+/// Pi 5 16GB weight cache: fixed DRAM window at 1 GiB, inside the already
+/// identity-mapped [0, 2 GiB) region (Normal cacheable 2 MiB blocks).
+///
+/// Placement rationale:
+/// - kernel image + statics end well below 0x1000_0000 (16 MiB)
+/// - 0x4000_0000 (1 GiB) is safely above any firmware reservation
+/// - 768 MiB covers Qwen3-0.6B q8_0 (640 MB) with 20% headroom
+/// - no additional page tables needed (identity map already covers it)
+/// - cache fill is blocked on SDHCI (Pi-8) for real SD access
 #[cfg(feature = "board-pi")]
-pub const WEIGHT_RAM_BASE: usize = 0;
+pub const WEIGHT_RAM_BASE: usize = 0x4000_0000;
 #[cfg(feature = "board-pi")]
-pub const WEIGHT_RAM_SIZE: usize = 0;
+pub const WEIGHT_RAM_SIZE: usize = 768 * 1024 * 1024;
