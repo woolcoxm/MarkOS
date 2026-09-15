@@ -544,19 +544,42 @@ pub fn gen_stream(payload: &[u8]) {
     let act = engine::activations_mut();
     let t_run = timer::uptime_ms();
 
-    // Prefill: prompt positions 0..n_tok through all layers.
+    // Multi-token batched prefill: embed all tokens, then process
+    // layer-by-layer for all tokens. Each layer weight tensor is read
+    // once for all tokens (memory traffic / n_tokens).
     for pos in 0..n_tok {
-        let row = emb_abs + (ids[pos] as u64) * (row_elems / 32 * 34) as u64;
-        if engine::dequant_q8_0_row(&vol, &file, row, row_elems, &mut act.x[..geo.n_embd])
+        let erow = emb_abs + (ids[pos] as u64) * (row_elems / 32 * 34) as u64;
+        if engine::dequant_q8_0_row(&vol, &file, erow, row_elems, &mut act.x[..geo.n_embd])
             .is_err()
         {
             tcp::stream(b"ERR embed\n");
             return;
         }
-        for l in 0..geo.n_layers as usize {
+        // Save the embedded hidden state for this token.
+        unsafe {
+            for i in 0..geo.n_embd {
+                engine::HIDS[pos][i] = act.x[i];
+            }
+        }
+    }
+    // Layer-major: each layer processes all tokens.
+    for l in 0..geo.n_layers as usize {
+        for pos in 0..n_tok {
+            // Load this token hidden state into the working buffer.
+            unsafe {
+                for i in 0..geo.n_embd {
+                    act.x[i] = engine::HIDS[pos][i];
+                }
+            }
             if engine::layer_forward(&vol, &file, ds, l, &geo, pos, act).is_err() {
                 tcp::stream(b"ERR layer\n");
                 return;
+            }
+            // Store the updated hidden state back.
+            unsafe {
+                for i in 0..geo.n_embd {
+                    engine::HIDS[pos][i] = act.x[i];
+                }
             }
             if l % 8 == 7 {
                 tcp::stream(b"# k\n");

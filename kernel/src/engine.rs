@@ -1298,3 +1298,9 @@ fn matvec_udot(
 
     Ok(())
 }
+
+/// Per-token hidden states for batched prefill (up to 8 tokens).
+/// Soundness: BSP-only scratch; the pool cores don't touch this buffer.
+/// Per-token hidden states for batched prefill (up to 8 tokens).
+/// Soundness: BSP-only scratch; the pool cores don't touch this buffer.
+pub static mut HIDS: [[f32; 3072]; 8] = [[0.0; 3072]; 8];
