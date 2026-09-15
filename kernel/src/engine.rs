@@ -1277,6 +1277,12 @@ fn matvec_udot(
 
     // Clean XQ so the MMU-off AP cores see the BSP's quantized writes.
     cache::clean_range(xq.as_ptr() as usize, n_in);
+    // Clean the descriptor statics too — on real A76 hardware the BSP's
+    // cached writes must reach RAM before the MMU-off APs read them.
+    cache::clean_range(
+        (&raw const PJ_ROW_BASE) as usize,
+        (&raw const PJ_XQ_PTR) as usize - (&raw const PJ_ROW_BASE) as usize + 8,
+    );
 
     // Set up the pool job descriptor.
     unsafe {
@@ -1299,8 +1305,6 @@ fn matvec_udot(
     Ok(())
 }
 
-/// Per-token hidden states for batched prefill (up to 8 tokens).
-/// Soundness: BSP-only scratch; the pool cores don't touch this buffer.
 /// Per-token hidden states for batched prefill (up to 8 tokens).
 /// Soundness: BSP-only scratch; the pool cores don't touch this buffer.
 pub static mut HIDS: [[f32; 3072]; 8] = [[0.0; 3072]; 8];
