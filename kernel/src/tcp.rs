@@ -20,6 +20,7 @@ fn listen_port() -> u16 {
 
 const FLAG_FIN: u8 = 1;
 const FLAG_SYN: u8 = 2;
+const FLAG_RST: u8 = 4;
 const FLAG_PSH: u8 = 8;
 const FLAG_ACK: u8 = 16;
 
@@ -59,24 +60,7 @@ pub fn input(seg: &[u8], src_ip: [u8; 4], src_mac: [u8; 6]) {
     match state {
         ST_LISTEN => {
             if flags & FLAG_SYN != 0 {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        src_mac.as_ptr(),
-                        &raw mut PEER_MAC as *mut u8,
-                        6,
-                    );
-                    core::ptr::copy_nonoverlapping(
-                        src_ip.as_ptr(),
-                        &raw mut PEER_IP as *mut u8,
-                        4,
-                    );
-                    PEER_PORT = src_port;
-                    SND_NXT = ISS.wrapping_add(1);
-                    RCV_NXT = seq.wrapping_add(1);
-                }
-                unsafe { STATE = ST_SYN_RCVD; }
-                // SYN-ACK: seq = ISS, ack = their seq + 1.
-                tcp_send_seg(ISS, seq.wrapping_add(1), FLAG_SYN | FLAG_ACK, &[]);
+                accept_syn(src_ip, src_mac, src_port, seq);
             }
         }
         ST_SYN_RCVD => {
@@ -86,10 +70,33 @@ pub fn input(seg: &[u8], src_ip: [u8; 4], src_mac: [u8; 6]) {
             }
         }
         ST_ESTAB => {
+            if flags & FLAG_RST != 0 {
+                // Peer abandoned the connection: free the slot.
+                unsafe { STATE = ST_LISTEN; }
+                uart::write_str("tcp: reset, listening\n");
+                return;
+            }
+            if flags & FLAG_SYN != 0 && payload_len == 0 {
+                // A fresh SYN while established means the peer dropped
+                // the old session and its FIN/RST never reached us (the
+                // appliance serves one client at a time, so the newest
+                // handshake wins): reset to it.
+                uart::write_str("tcp: peer re-handshake\n");
+                accept_syn(src_ip, src_mac, src_port, seq);
+                return;
+            }
             if payload_len > 0 && seq == rcv_nxt_load() {
-                // In-order data: accept and run the protocol handler.
-                handle_payload(payload);
+                // Advance RCV_NXT BEFORE running the handler: the reply
+                // must ACK the request bytes it answers, and a peer
+                // retransmission of the same request during a long handler
+                // (LOAD) is then seen as duplicate, not re-executed.
+                // Stream commands (GEN) need this most: they run for
+                // minutes while the decode loop services the NIC between
+                // tokens, and a poll sent mid-generation must validate as
+                // in-order inside that drain — a frame rejected here is
+                // discarded, which would strand the byte stream.
                 rcv_nxt_store(seq.wrapping_add(payload_len as u32));
+                handle_payload(payload);
             } else if payload_len > 0 {
                 // Duplicate/out-of-order: re-acknowledge what we expect.
                 send_ack(rcv_nxt_load());
@@ -105,6 +112,21 @@ pub fn input(seg: &[u8], src_ip: [u8; 4], src_mac: [u8; 6]) {
         }
         _ => {}
     }
+}
+
+/// Accept a handshake: lock the peer, initialize sequence numbers, reply
+/// SYN-ACK, and move to SYN-RCVD.
+fn accept_syn(src_ip: [u8; 4], src_mac: [u8; 6], src_port: u16, seq: u32) {
+    unsafe {
+        core::ptr::copy_nonoverlapping(src_mac.as_ptr(), &raw mut PEER_MAC as *mut u8, 6);
+        core::ptr::copy_nonoverlapping(src_ip.as_ptr(), &raw mut PEER_IP as *mut u8, 4);
+        PEER_PORT = src_port;
+        SND_NXT = ISS.wrapping_add(1);
+        RCV_NXT = seq.wrapping_add(1);
+        STATE = ST_SYN_RCVD;
+    }
+    // SYN-ACK: seq = ISS, ack = their seq + 1.
+    tcp_send_seg(ISS, seq.wrapping_add(1), FLAG_SYN | FLAG_ACK, &[]);
 }
 
 /// Protocol handler for received payloads: the MARKOS-PING transport probe,
@@ -144,6 +166,25 @@ fn handle_payload(payload: &[u8]) {
 /// protocol's streaming commands (GEN emits a line per generated token).
 pub fn stream(payload: &[u8]) {
     reply(payload);
+    // Drain the NIC immediately after every streamed line: the peer reacts
+    // to a TOK within milliseconds (a STATS poll), and a frame that lands
+    // while the previous one is still being answered must be consumed as
+    // soon as its sequence number becomes expected — the single-buffer
+    // drain discards a frame it rejects, so leaving it pending past the
+    // next handler run would strand the stream. Bounded reentrancy: a
+    // command answered inside this drain replies through reply(), which
+    // does not re-enter poll().
+    net::poll();
+}
+
+/// Drain frames that arrived while GEN was decoding and answer any control
+/// command they carry — a STATS poll sent on the connection mid-generation
+/// is replied to here (Phase 10: stats update live during a sustained run).
+/// Called from the GEN decode loop on the BSP between tokens: net::poll is
+/// a serialized used-ring drain, and a reentrant GEN is refused by the
+/// control layer's in-progress guard.
+pub fn service_between_tokens() {
+    net::poll();
 }
 
 /// Send payload to the peer and advance SND_NXT.

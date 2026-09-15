@@ -6,8 +6,11 @@
 //! Commands:
 //!   HELLO | MARKOS HELLO -> banner + hardware capabilities
 //!   STATUS               -> load state, uptime, commands served
+//!   STATS                -> live health/generation counters (Phase 10)
 //!   LOAD                 -> mount SD (FAT32), read MODEL.BIN, validate GGUF
 //!   RUN                  -> UDOT matmul over mm.a x mm.b across all cores
+//!   GEN <steps> <prompt> -> stream TOK lines per generated token (Phase 9);
+//!                           answered STATS polls between decode steps
 //!   PING / ECHO <text>   -> liveness / debug
 //!
 //! owns: the loaded model image and load/run state.
@@ -414,6 +417,16 @@ fn run(w: &mut BufW) {
 
 // ===== GEN: streaming generation over the control transport (Phase 9) =====
 
+/// Maximum tokens in one GEN session. 64 keeps a sustained run (>50, the
+/// Phase 10/11 observability gate) inside MAX_POS (128) even with a
+/// full 16-token prompt.
+pub const GEN_MAX_STEPS: usize = 64;
+
+/// Reentry guard: GEN runs for minutes while the decode loop services the
+/// NIC between tokens, so a second GEN arriving mid-stream must be refused
+/// here rather than run reentrantly.
+static mut IN_GEN: bool = false;
+
 /// GEN emits replies while it decodes (one TOK line per generated token),
 /// so tcp.rs routes it here instead of the single-response dispatch.
 /// Requires an authenticated connection.
@@ -421,6 +434,16 @@ pub fn is_stream_command(payload: &[u8]) -> bool {
     let authed = unsafe { AUTHED };
     authed
         && (payload == b"GEN" || (payload.len() > 4 && &payload[..4] == b"GEN "))
+}
+
+pub fn gen_stream(payload: &[u8]) {
+    if unsafe { IN_GEN } {
+        tcp::stream(b"ERR busy (generation in progress)\n");
+        return;
+    }
+    unsafe { IN_GEN = true };
+    gen_stream_inner(payload);
+    unsafe { IN_GEN = false };
 }
 
 fn decimal(bytes: &[u8]) -> Option<u32> {
@@ -437,12 +460,15 @@ fn decimal(bytes: &[u8]) -> Option<u32> {
 }
 
 /// GEN <steps> <prompt>: tokenize, prefill through every layer, then
-/// stream "TOK g=<g> id=<id> text=<bytes>" per greedy step and a final
+/// stream "TOK g=<g> id=<id> ms=<dt> gen_tokens=<n> tps_milli=<tps>
+/// uptime_ms=<t> [text=<bytes>]" per greedy step and a final
 /// "GEN_END ids=.. n=..". Text is included only when the decoded token is
 /// printable ASCII (newlines etc. would break the line protocol).
-/// Runs on the BSP; the NIC is not polled for the duration — the client
-/// must read continuously (single connection, documented limitation).
-pub fn gen_stream(payload: &[u8]) {
+/// Runs on the BSP; the NIC is serviced between decode steps, so a client
+/// may poll STATS on the same connection mid-run (Phase 10). All other
+/// traffic must still come from the same peer (single connection,
+/// documented limitation).
+fn gen_stream_inner(payload: &[u8]) {
     if !unsafe { META_OK } {
         tcp::stream(b"ERR no meta model (LOAD a large GGUF first)\n");
         return;
@@ -463,7 +489,7 @@ pub fn gen_stream(payload: &[u8]) {
     let sp0 = match payload.iter().position(|&b| b == b' ') {
         Some(i) => i,
         None => {
-            tcp::stream(b"ERR usage: GEN <steps 1-8> <prompt>\n");
+            tcp::stream(b"ERR usage: GEN <steps 1-64> <prompt>\n");
             return;
         }
     };
@@ -471,20 +497,20 @@ pub fn gen_stream(payload: &[u8]) {
     let sp1 = match rest.iter().position(|&b| b == b' ') {
         Some(i) => i,
         None => {
-            tcp::stream(b"ERR usage: GEN <steps 1-8> <prompt>\n");
+            tcp::stream(b"ERR usage: GEN <steps 1-64> <prompt>\n");
             return;
         }
     };
     let steps = match decimal(&rest[..sp1]) {
-        Some(s) if (1..=8).contains(&s) => s as usize,
+        Some(s) if (1..=GEN_MAX_STEPS as u32).contains(&s) => s as usize,
         _ => {
-            tcp::stream(b"ERR steps must be 1-8\n");
+            tcp::stream(b"ERR steps must be 1-64\n");
             return;
         }
     };
     let prompt = &rest[sp1 + 1..];
     if prompt.is_empty() {
-        tcp::stream(b"ERR usage: GEN <steps 1-8> <prompt>\n");
+        tcp::stream(b"ERR usage: GEN <steps 1-64> <prompt>\n");
         return;
     }
 
@@ -590,7 +616,7 @@ pub fn gen_stream(payload: &[u8]) {
     // Greedy steps: norm -> argmax -> stream -> feed back. Each iteration
     // is one served token: timer ticks are accumulated for the STATS
     // tokens/sec and per-token latency fields (Phase 10).
-    let mut gen_ids = [0u32; 8];
+    let mut gen_ids = [0u32; GEN_MAX_STEPS];
     for g in 0..steps {
         let t0 = timer::uptime_ms();
         if engine::rmsnorm_with_weight(
@@ -608,11 +634,34 @@ pub fn gen_stream(payload: &[u8]) {
             return;
         };
         gen_ids[g] = tok;
-        let mut line = [0u8; 96];
+        // Settle this token's accounting BEFORE the line goes out: the
+        // inline counters on the TOK line and any mid-run STATS reply the
+        // client polls right after reading it then agree exactly.
+        let dt = timer::uptime_ms().saturating_sub(t0);
+        let (tot, tps_milli) = unsafe {
+            GEN_TOKENS += 1;
+            GEN_MS += dt;
+            if dt < GEN_MS_MIN {
+                GEN_MS_MIN = dt;
+            }
+            if dt > GEN_MS_MAX {
+                GEN_MS_MAX = dt;
+            }
+            let ms = GEN_MS;
+            (
+                GEN_TOKENS,
+                if ms > 0 { GEN_TOKENS * 1_000_000 / ms } else { 0 },
+            )
+        };
+        let up_ms = timer::uptime_ms();
+        let mut line = [0u8; 192];
         let mut w = BufW { buf: &mut line, len: 0 };
         let _ = fmt::write(
             &mut w,
-            format_args!("TOK g={g} id={tok} logit={logit:.6e}"),
+            format_args!(
+                "TOK g={g} id={tok} logit={logit:.6e} ms={dt} gen_tokens={tot} \
+                 tps_milli={tps_milli} uptime_ms={up_ms}"
+            ),
         );
         // Detokenized text when fully printable ASCII.
         let mut txt = [0u8; 32];
@@ -627,6 +676,11 @@ pub fn gen_stream(payload: &[u8]) {
         let l = w.len;
         tcp::stream(&line[..l]);
         uart::locked_write(format_args!("gen: step {g} tok {tok}\n"));
+
+        // Service the NIC between tokens: a STATS command the client sent
+        // on this connection after the previous TOK is answered here, so
+        // observability runs live during generation (Phase 10).
+        tcp::service_between_tokens();
 
         if g + 1 < steps {
             let row = emb_abs + (tok as u64) * (row_elems / 32 * 34) as u64;
@@ -644,17 +698,6 @@ pub fn gen_stream(payload: &[u8]) {
                 if l % 8 == 7 {
                     tcp::stream(b"# k\n");
                 }
-            }
-        }
-        let dt = timer::uptime_ms().saturating_sub(t0);
-        unsafe {
-            GEN_TOKENS += 1;
-            GEN_MS += dt;
-            if dt < GEN_MS_MIN {
-                GEN_MS_MIN = dt;
-            }
-            if dt > GEN_MS_MAX {
-                GEN_MS_MAX = dt;
             }
         }
     }

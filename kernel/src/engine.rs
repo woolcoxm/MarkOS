@@ -652,7 +652,10 @@ pub fn tokenize(
 
 // ===== full-model decode (Phase 8b) =====
 
-pub const MAX_POS: usize = 8; // cached positions for the gate
+/// Cached positions: prompt + generated tokens for one session. 128
+/// positions cover a MAX_TOKENS prompt plus a 64-step sustained GEN with
+/// headroom (KV cost: 2 x 32x128x1024 x 4 B = 32 MiB of bss).
+pub const MAX_POS: usize = 128;
 const MAX_KV_DIM: usize = 1024; // n_kv * head_dim (8 * 128)
 const MAX_LAYERS: usize = 32;
 
@@ -1319,6 +1322,7 @@ fn matvec_udot(
 
 
 
-/// Per-token hidden states for batched prefill (up to 8 tokens).
+/// Per-token hidden states for batched prefill (up to MAX_TOKENS tokens —
+/// one row per prompt token, so gen_stream can never index out of bounds).
 /// Soundness: BSP-only scratch; the pool cores don't touch this buffer.
-pub static mut HIDS: [[f32; 3072]; 8] = [[0.0; 3072]; 8];
+pub static mut HIDS: [[f32; 3072]; MAX_TOKENS] = [[0.0; 3072]; MAX_TOKENS];

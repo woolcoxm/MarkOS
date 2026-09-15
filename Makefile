@@ -278,7 +278,7 @@ test-smp: image-virt
 clean:
 	cargo clean || true
 	rm -f $(IMAGE) $(PI5_IMAGE) $(VIRT_IMAGE) serial.log serial-exc.log serial-smp.log serial-blk.log
-	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log serial-net.log client.log serial-ctl.log client-ctl.log serial-soak.log client-soak.log serial-inst.log client-inst.log client-gennet.log serial-gennet.log client-gensoak.log serial-gensoak.log net.pcap
+	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log serial-net.log client.log serial-ctl.log client-ctl.log serial-soak.log client-soak.log serial-inst.log client-inst.log client-gennet.log serial-gennet.log client-gensoak.log serial-gensoak.log client-sustain.log serial-sustain.log net.pcap
 
 ## Phase 9 acceptance: GEN over TCP — prompt in, streamed tokens out, end
 ## to end through the authenticated control transport (real GGUF image).
@@ -308,6 +308,22 @@ test-gensoak: image-virt $(REAL_IMG)
 	python3 scripts/gen_client.py 127.0.0.1 8080 $(HOME)/.markos-tests/gen-expected.txt --structural --soak 3 > client-gensoak.log 2>&1; rc=$$?; tail -10 client-gensoak.log; \
 	kill $$qpid 2>/dev/null; \
 	[ $$rc -eq 0 ] && echo "PASS: generation soak" || { echo "FAIL: generation soak"; exit 1; }
+
+## Phase 10/11 acceptance: sustained single-session generation — one GEN of
+## 64 streamed tokens (>50) over ONE TCP connection, with a STATS poll sent
+## after every TOK and answered by the kernel between decode steps. Evidences
+## live stats during generation (Phase 10), a live clock, bounded per-token
+## latency with no drift across a long run, and no crash/leak over the whole
+## session (Phase 11's allocator-free engine: statics only).
+test-sustain: export RUSTFLAGS = -C target-feature=+dotprod
+test-sustain: image-virt $(REAL_IMG)
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-net
+	bash scripts/kill_qemu.sh; sleep 1; \
+	timeout 2700 $(QEMU) -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -m 2048 -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-sustain.log 2>&1 & qpid=$$!; \
+	sleep 10; \
+	python3 scripts/sustain_client.py 127.0.0.1 8080 > client-sustain.log 2>&1; rc=$$?; tail -15 client-sustain.log; \
+	kill $$qpid 2>/dev/null; \
+	[ $$rc -eq 0 ] && echo "PASS: sustained generation session" || { echo "FAIL: sustained generation session"; exit 1; }
 
 distclean: clean
 	rm -rf $(HOME)/.markos-target
