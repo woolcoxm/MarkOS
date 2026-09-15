@@ -238,6 +238,7 @@ pub fn read_f32_vec(
 
 /// y[n_out] = W @ x, W q8_0 [n_out rows x n_in] read from the volume in
 /// row chunks. GGUF q8_0 block: f16 scale + 32 int8 quants (34 B).
+
 pub fn matvec_q8_0(
     vol: &FatVolume,
     file: &File,
@@ -1077,8 +1078,11 @@ fn mv_job(core_id: usize, _arg: u64) {
             };
             let s = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
             let xoff = b * 32;
-            for j in 0..32 {
-                acc += unsafe { *MV_X.add(xoff + j) } * s * ((blk[2 + j] as i8) as f32);
+            // Soundness: in-bounds block of the cached row/activation.
+            unsafe {
+                for j in 0..32 {
+                    acc += *MV_X.add(xoff + j) * s * ((blk[2 + j] as i8) as f32);
+                }
             }
         }
         unsafe {
@@ -1110,9 +1114,18 @@ pub fn matvec_q8_0_par(x: &[f32], y: &mut [f32], abs: u64, n_in: usize, n_out: u
     }
     // BSP writes x (cached): make it visible to the MMU-off cores.
     cache::clean_range(x.as_ptr() as usize, n_in * 4);
+    // The job descriptor statics were written by the BSP through its cache
+    // moments ago — the MMU-off cores read them from RAM, so clean them.
+    cache::clean_range(
+        (&raw const MV_ABS) as usize,
+        (&raw const MV_BARRIER) as usize - (&raw const MV_ABS) as usize + 8,
+    );
     pool::run_on_all(mv_job, 0, board::CORE_COUNT);
-    // Cores wrote y with the MMU off (uncached): drop the BSP's stale
-    // cached lines before it reads the results.
+    // Results: the BSP wrote its own rows through the cache (dirty lines),
+    // the MMU-off cores wrote theirs straight to RAM. Clean the BSP's rows
+    // out to RAM, then drop ALL cached copies so the BSP reads every
+    // core's result from memory.
+    cache::clean_range(y.as_ptr() as usize, n_out * 4);
     cache::invalidate_range(y.as_ptr() as usize, n_out * 4);
     Ok(())
 }

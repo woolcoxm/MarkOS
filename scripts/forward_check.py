@@ -18,7 +18,7 @@ def rows(path):
     out = []
     for line in open(path):
         line = line.strip()
-        if line:
+        if line and not line.startswith("PASS:"):
             out.append(line.split())
     return out
 

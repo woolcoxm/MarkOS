@@ -279,6 +279,10 @@ fn load(w: &mut BufW) {
                     ));
                 }
             }
+            // The pool cores run with their MMU off (uncached reads):
+            // flush the BSP's cached fill writes all the way to RAM or the
+            // cores would decode from stale weight bytes.
+            cache::clean_range(board::WEIGHT_RAM_BASE, file.size as usize);
             engine::set_ram_weights(true);
             ram = 1;
         }
@@ -539,6 +543,64 @@ pub fn gen_stream(payload: &[u8]) {
 
     let act = engine::activations_mut();
     let t_run = timer::uptime_ms();
+
+    // TEMP A/B: same matvec, serial-volume vs RAM-parallel.
+    if true {
+        let Some((_, qd, _, qoff)) = gguf::find_tensor(b"blk.0.attn_q.weight") else {
+            tcp::stream(b"ERR ab\n");
+            return;
+        };
+        let qabs = ds + qoff;
+        let n_in = qd[0] as usize;
+        let n_out = qd[1] as usize;
+        let mut xa = [0f32; 1024];
+        {
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (&raw const META_BUF) as *const u8 as *mut u8,
+                    4096,
+                )
+            };
+            let _ = buf;
+        }
+        for (i, v) in xa.iter_mut().enumerate() {
+            *v = ((i * 7) % 251) as f32 / 251.0 - 0.5;
+        }
+        let mut y1 = [0f32; 2048];
+        let mut y2 = [0f32; 2048];
+        engine::set_ram_weights(false);
+        let _ = engine::matvec_q8_0(&vol, &file, qabs, n_in, n_out, &xa, &mut y1);
+        engine::set_ram_weights(true);
+        let _ = engine::matvec_q8_0_par(&xa, &mut y2, qabs, n_in, n_out);
+        let s1: f64 = y1.iter().map(|v| *v as f64).sum();
+        let s2: f64 = y2.iter().map(|v| *v as f64).sum();
+        let mut volb = [0u8; 8];
+        let _ = vol.read_at(&file, qabs, &mut volb);
+        let ramb = unsafe {
+            core::slice::from_raw_parts(
+                (board::WEIGHT_RAM_BASE + qabs as usize) as *const u8,
+                8,
+            )
+        };
+        let rowb = unsafe {
+            core::slice::from_raw_parts(
+                (board::WEIGHT_RAM_BASE + qabs as usize + 1088) as *const u8,
+                8,
+            )
+        };
+        uart::locked_write(format_args!(
+            "AB serial={s1:.6e} par={s2:.6e} v0={:.6e}/{:.6e}\n",
+            y1[0], y2[0]
+        ));
+        uart::locked_write(format_args!(
+            "AB bytes vol={:02x?} ram={:02x?} ramrow1={:02x?}\n",
+            volb, ramb, rowb
+        ));
+        uart::locked_write(format_args!(
+            "AB rows y[0]={:.6e} y[512]={:.6e} y[1024]={:.6e} y[1536]={:.6e}\n",
+            y2[0], y2[512], y2[1024], y2[1536]
+        ));
+    }
 
     // Prefill: prompt positions 0..n_tok through all layers.
     for pos in 0..n_tok {
