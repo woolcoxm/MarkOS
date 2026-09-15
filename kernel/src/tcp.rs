@@ -115,6 +115,13 @@ fn handle_payload(payload: &[u8]) {
         uart::write_str("net: PASS ping/pong round trip\n");
         return;
     }
+    // GEN streams multiple replies as tokens are decoded; it talks to the
+    // peer directly through stream().
+    if crate::control::is_stream_command(payload) {
+        uart::locked_write(format_args!("control: stream command\n"));
+        crate::control::gen_stream(payload);
+        return;
+    }
     let mut resp = [0u8; 512];
     let n = crate::control::dispatch(payload, &mut resp);
     if n > 0 {
@@ -131,6 +138,12 @@ fn handle_payload(payload: &[u8]) {
     } else {
         reply(payload);
     }
+}
+
+/// Stream one payload to the peer and advance SND_NXT. Used by the control
+/// protocol's streaming commands (GEN emits a line per generated token).
+pub fn stream(payload: &[u8]) {
+    reply(payload);
 }
 
 /// Send payload to the peer and advance SND_NXT.

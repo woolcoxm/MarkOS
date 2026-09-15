@@ -276,7 +276,20 @@ test-smp: image-virt
 clean:
 	cargo clean || true
 	rm -f $(IMAGE) $(PI5_IMAGE) $(VIRT_IMAGE) serial.log serial-exc.log serial-smp.log serial-blk.log
-	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log serial-net.log client.log serial-ctl.log client-ctl.log serial-soak.log client-soak.log serial-inst.log client-inst.log net.pcap
+	rm -f $(TEST_IMG) $(FAT_TEST_IMG) tests/fatpart.img tests/MODEL.BIN serial-pool.log serial-mm.log serial-net.log client.log serial-ctl.log client-ctl.log serial-soak.log client-soak.log serial-inst.log client-inst.log client-gennet.log serial-gennet.log net.pcap
+
+## Phase 9 acceptance: GEN over TCP — prompt in, streamed tokens out, end
+## to end through the authenticated control transport (real GGUF image).
+test-gen-net: export RUSTFLAGS = -C target-feature=+dotprod
+test-gen-net: image-virt $(REAL_IMG)
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-net
+	python3 scripts/forward_ref.py $(MODEL_FILE) $(HOME)/.markos-tests/gen-expected.txt --gen 2
+	bash scripts/kill_qemu.sh; sleep 1; \
+	timeout 560 $(QEMU) -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-gennet.log 2>&1 & qpid=$$!; \
+	sleep 4; \
+	python3 scripts/gen_client.py 127.0.0.1 8080 $(HOME)/.markos-tests/gen-expected.txt > client-gennet.log 2>&1; rc=$$?; cat client-gennet.log; \
+	kill $$qpid 2>/dev/null; \
+	[ $$rc -eq 0 ] && echo "PASS: gen over tcp" || { echo "FAIL: gen over tcp"; exit 1; }
 
 distclean: clean
 	rm -rf $(HOME)/.markos-target

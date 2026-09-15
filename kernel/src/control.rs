@@ -15,12 +15,19 @@
 //! responses are formatted into a caller-provided fixed buffer. Commands
 //! must arrive in one TCP segment (Pi-8 hardening: reassembly).
 
-use crate::{board, cache, config, cpu, fat, gguf, matmul, pool, timer, uart, virtio_blk};
+use crate::{board, cache, config, cpu, engine, fat, gguf, matmul, pool, tcp, timer, uart, virtio_blk};
 use core::fmt;
 
 const MODEL_CAP: usize = 65536;
+/// Metadata window for real GB-scale GGUFs (Qwen3-0.6B needs ~6 MB).
+const META_CAP: usize = 8 * 1024 * 1024;
 
 static mut MODEL_BUF: [u8; MODEL_CAP] = [0u8; MODEL_CAP];
+/// Metadata section of a meta-mode (big) model: kv pairs + tensor table +
+/// tokenizer arrays. Weights stay on the volume and stream per-matvec.
+static mut META_BUF: [u8; META_CAP] = [0u8; META_CAP];
+static mut META_LEN: usize = 0;
+static mut META_OK: bool = false;
 static mut MODEL_BYTES: usize = 0;
 static mut MODEL_TENSORS: u64 = 0;
 static mut DATA_START: u64 = 0;
@@ -190,6 +197,50 @@ fn load(w: &mut BufW) {
             return;
         }
     };
+    // Two load modes: files that fit MODEL_BUF are read fully (the
+    // synthetic mm.a/mm.b matmul path); real GB-scale GGUFs load
+    // metadata-only — the engine streams their weights from the volume
+    // during GEN.
+    if file.size as usize > MODEL_CAP {
+        let n = {
+            // Soundness: META_BUF is control-plane scratch on the BSP.
+            let buf = unsafe {
+                core::slice::from_raw_parts_mut((&raw mut META_BUF) as *mut u8, META_CAP)
+            };
+            match vol.read_at(&file, 0, buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = fmt::write(w, format_args!("ERR read {e}"));
+                    return;
+                }
+            }
+        };
+        let meta = unsafe {
+            core::slice::from_raw_parts((&raw const META_BUF) as *const u8, n)
+        };
+        let info = match gguf::parse_and_dump(meta) {
+            Ok(i) => i,
+            Err(e) => {
+                let _ = fmt::write(w, format_args!("ERR gguf {e}"));
+                return;
+            }
+        };
+        unsafe {
+            META_LEN = n;
+            META_OK = true;
+            MODEL_BYTES = file.size as u64 as usize;
+            MODEL_TENSORS = info.tensor_count;
+            DATA_START = info.data_start;
+        }
+        let _ = fmt::write(
+            w,
+            format_args!(
+                "OK loaded bytes={} gguf=v{} tensors={} meta=1",
+                file.size, info.version, info.tensor_count
+            ),
+        );
+        return;
+    }
     let n = {
         // Soundness: MODEL_BUF is control-plane scratch on the BSP; the
         // device DMAs into it while the poll loop is the only runner.
@@ -305,4 +356,221 @@ fn run(w: &mut BufW) {
             (mismatches == 0) as u8
         ),
     );
+}
+
+// ===== GEN: streaming generation over the control transport (Phase 9) =====
+
+/// GEN emits replies while it decodes (one TOK line per generated token),
+/// so tcp.rs routes it here instead of the single-response dispatch.
+/// Requires an authenticated connection.
+pub fn is_stream_command(payload: &[u8]) -> bool {
+    let authed = unsafe { AUTHED };
+    authed
+        && (payload == b"GEN" || (payload.len() > 4 && &payload[..4] == b"GEN "))
+}
+
+fn decimal(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || bytes.len() > 2 {
+        return None;
+    }
+    bytes.iter().try_fold(0u32, |acc, &b| {
+        if b.is_ascii_digit() {
+            Some(acc * 10 + (b - b'0') as u32)
+        } else {
+            None
+        }
+    })
+}
+
+/// GEN <steps> <prompt>: tokenize, prefill through every layer, then
+/// stream "TOK g=<g> id=<id> text=<bytes>" per greedy step and a final
+/// "GEN_END ids=.. n=..". Text is included only when the decoded token is
+/// printable ASCII (newlines etc. would break the line protocol).
+/// Runs on the BSP; the NIC is not polled for the duration — the client
+/// must read continuously (single connection, documented limitation).
+pub fn gen_stream(payload: &[u8]) {
+    if !unsafe { META_OK } {
+        tcp::stream(b"ERR no meta model (LOAD a large GGUF first)\n");
+        return;
+    }
+    // The dispatch path trims line terminators; the stream path must too,
+    // or the prompt gains a newline token and generation shifts a step.
+    let payload = {
+        let mut p = payload;
+        while let Some((&b, rest)) = p.split_last() {
+            if b == b'\n' || b == b'\r' {
+                p = rest;
+            } else {
+                break;
+            }
+        }
+        p
+    };
+    let sp0 = match payload.iter().position(|&b| b == b' ') {
+        Some(i) => i,
+        None => {
+            tcp::stream(b"ERR usage: GEN <steps 1-8> <prompt>\n");
+            return;
+        }
+    };
+    let rest = &payload[sp0 + 1..];
+    let sp1 = match rest.iter().position(|&b| b == b' ') {
+        Some(i) => i,
+        None => {
+            tcp::stream(b"ERR usage: GEN <steps 1-8> <prompt>\n");
+            return;
+        }
+    };
+    let steps = match decimal(&rest[..sp1]) {
+        Some(s) if (1..=8).contains(&s) => s as usize,
+        _ => {
+            tcp::stream(b"ERR steps must be 1-8\n");
+            return;
+        }
+    };
+    let prompt = &rest[sp1 + 1..];
+    if prompt.is_empty() {
+        tcp::stream(b"ERR usage: GEN <steps 1-8> <prompt>\n");
+        return;
+    }
+
+    let meta_len = unsafe { META_LEN };
+    let meta = unsafe {
+        core::slice::from_raw_parts((&raw const META_BUF) as *const u8, meta_len)
+    };
+    let ds = unsafe { DATA_START };
+
+    let geo = match engine::geometry() {
+        Ok(g) => g,
+        Err(_) => {
+            tcp::stream(b"ERR geometry\n");
+            return;
+        }
+    };
+    let vol = match fat::mount() {
+        Ok(v) => v,
+        Err(_) => {
+            tcp::stream(b"ERR fat\n");
+            return;
+        }
+    };
+    let file = match vol.open_model() {
+        Ok(f) => f,
+        Err(_) => {
+            tcp::stream(b"ERR model\n");
+            return;
+        }
+    };
+    let Some((_, emb_dims, _, emb_off)) = gguf::find_tensor(b"token_embd.weight") else {
+        tcp::stream(b"ERR token_embd missing\n");
+        return;
+    };
+    let Some((_, _, _, fin_off)) = gguf::find_tensor(b"output_norm.weight") else {
+        tcp::stream(b"ERR output_norm missing\n");
+        return;
+    };
+    let row_elems = emb_dims[0] as usize;
+    let vocab = emb_dims[1] as u64;
+    let emb_abs = ds + emb_off;
+    let fin_abs = ds + fin_off;
+
+    let mut ids = [0u32; engine::MAX_TOKENS];
+    let n_tok = match engine::tokenize(meta, prompt, &mut ids) {
+        Ok(n) if n > 0 => n,
+        _ => {
+            tcp::stream(b"ERR tokenize\n");
+            return;
+        }
+    };
+    if n_tok + steps > engine::MAX_POS {
+        tcp::stream(b"ERR prompt+steps exceed position cache\n");
+        return;
+    }
+
+    let act = engine::activations_mut();
+
+    // Prefill: prompt positions 0..n_tok through all layers.
+    for pos in 0..n_tok {
+        let row = emb_abs + (ids[pos] as u64) * (row_elems / 32 * 34) as u64;
+        if engine::dequant_q8_0_row(&vol, &file, row, row_elems, &mut act.x[..geo.n_embd])
+            .is_err()
+        {
+            tcp::stream(b"ERR embed\n");
+            return;
+        }
+        for l in 0..geo.n_layers as usize {
+            if engine::layer_forward(&vol, &file, ds, l, &geo, pos, act).is_err() {
+                tcp::stream(b"ERR layer\n");
+                return;
+            }
+        }
+    }
+
+    // Greedy steps: norm -> argmax -> stream -> feed back.
+    let mut gen_ids = [0u32; 8];
+    for g in 0..steps {
+        if engine::rmsnorm_with_weight(
+            &vol, &file, fin_abs, &act.x[..geo.n_embd], &mut act.n1[..geo.n_embd], geo.eps,
+        )
+        .is_err()
+        {
+            tcp::stream(b"ERR final norm\n");
+            return;
+        }
+        let Ok((tok, logit)) =
+            engine::argmax_q8_0(&vol, &file, emb_abs, row_elems, vocab, &act.n1[..geo.n_embd])
+        else {
+            tcp::stream(b"ERR lm_head\n");
+            return;
+        };
+        gen_ids[g] = tok;
+        let mut line = [0u8; 96];
+        let mut w = BufW { buf: &mut line, len: 0 };
+        let _ = fmt::write(
+            &mut w,
+            format_args!("TOK g={g} id={tok} logit={logit:.6e}"),
+        );
+        // Detokenized text when fully printable ASCII.
+        let mut txt = [0u8; 32];
+        if let Some(n) = engine::detok(meta, tok, &mut txt) {
+            if txt[..n].iter().all(|&b| (0x20..0x7F).contains(&b)) {
+                let _ = fmt::write(&mut w, format_args!(" text="));
+                w.buf[w.len..w.len + n].copy_from_slice(&txt[..n]);
+                w.len += n;
+            }
+        }
+        let _ = fmt::write(&mut w, format_args!("\n"));
+        let l = w.len;
+        tcp::stream(&line[..l]);
+        uart::locked_write(format_args!("gen: step {g} tok {tok}\n"));
+
+        if g + 1 < steps {
+            let row = emb_abs + (tok as u64) * (row_elems / 32 * 34) as u64;
+            if engine::dequant_q8_0_row(&vol, &file, row, row_elems, &mut act.x[..geo.n_embd])
+                .is_err()
+            {
+                tcp::stream(b"ERR embed\n");
+                return;
+            }
+            for l in 0..geo.n_layers as usize {
+                if engine::layer_forward(&vol, &file, ds, l, &geo, n_tok + g, act).is_err() {
+                    tcp::stream(b"ERR layer\n");
+                    return;
+                }
+            }
+        }
+    }
+
+    let mut end = [0u8; 96];
+    let mut w = BufW { buf: &mut end, len: 0 };
+    let _ = fmt::write(&mut w, format_args!("GEN_END ids="));
+    for (i, t) in gen_ids.iter().take(steps).enumerate() {
+        if i > 0 {
+            let _ = fmt::write(&mut w, format_args!(","));
+        }
+        let _ = fmt::write(&mut w, format_args!("{t}"));
+    }
+    let _ = fmt::write(&mut w, format_args!(" n={steps}\n"));
+    let l = w.len;
+    tcp::stream(&end[..l]);
 }

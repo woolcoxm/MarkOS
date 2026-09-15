@@ -15,7 +15,7 @@ find kernel/src -name '*.rs' -exec touch {} +
 pkill -f "^qemu-system-[a]arch64" 2>/dev/null
 sleep 1
 
-gates=(test-exceptions test-smp test-block test-fat test-pool test-matmul test-net test-control test-install test-soak test-pcie test-model test-forward test-gen)
+gates=(test-exceptions test-smp test-block test-fat test-pool test-matmul test-net test-control test-install test-soak test-pcie test-model test-forward test-gen test-gen-net)
 [ $# -gt 0 ] && gates=("$@")
 
 fails=0

@@ -70,6 +70,10 @@ make test-pcie                     # or any single gate
 | test-install | installer-baked MARKOS.CFG drives port + token; wrong token rejected |
 | test-soak | 40 rounds RUN+ECHO on one connection (RX-ring wraparound killer) |
 | test-pcie | bare-metal ECAM enumeration (host bridge, NIC, root port) |
+| test-model | real 640 MB Qwen3-0.6B q8_0: 310-tensor table + payload CRCs byte-match the host reference |
+| test-forward | layer-0 forward (BPE, embedding, q8_0 matmuls, RoPE, GQA attention, SwiGLU) matches the numpy reference |
+| test-gen | full 28-layer prefill + greedy decode matches the reference token-for-token |
+| test-gen-net | GEN opcode over TCP: prompt in, streamed TOK lines + GEN_END out, ids/text vs reference |
 | test-model | real 640 MB Qwen3-0.6B q8_0 loaded: full 310-tensor table + payload CRCs byte-match the host reference (`scripts/gguf_ref.py`) |
 
 ## Building and running (from Windows, via WSL)

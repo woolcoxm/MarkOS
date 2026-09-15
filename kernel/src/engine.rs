@@ -937,3 +937,59 @@ pub fn argmax_q8_0(
     }
     Ok((best_i, best_v))
 }
+
+// ===== detokenization (Phase 9) =====
+
+/// Reverse map a byte-unicode codepoint back to its byte.
+fn cp_to_byte(cp: u32) -> Option<u8> {
+    match cp {
+        0..=126 => Some(cp as u8),
+        161..=172 | 174..=255 => Some(cp as u8),
+        256..=288 => Some((cp - 256) as u8),
+        289..=322 => Some((cp - 162) as u8),
+        323 => Some(173),
+        _ => None,
+    }
+}
+
+/// Decode vocab entry uid=1000(mark) gid=1000(mark) groups=1000(mark),27(sudo) back to raw bytes (reverse of byte-unicode).
+/// Walks the vocab array sequentially — id lookups are rare (one per
+/// generated token) so the linear scan is acceptable.
+pub fn detok(data: &[u8], id: u32, out: &mut [u8]) -> Option<usize> {
+    let (voff, vcount) = gguf::string_array(b"tokenizer.ggml.tokens")?;
+    if id >= vcount {
+        return None;
+    }
+    let mut it = StrIter::new(data, voff, vcount);
+    let mut i = 0u32;
+    let s = loop {
+        let s = it.next()?;
+        if i == id {
+            break s;
+        }
+        i += 1;
+    };
+    let mut n = 0usize;
+    let mut j = 0usize;
+    while j < s.len() {
+        let b = s[j];
+        let (cp, used) = if b < 0x80 {
+            (b as u32, 1usize)
+        } else if b & 0xE0 == 0xC0 && j + 1 < s.len() {
+            (
+                (((b & 0x1F) as u32) << 6) | ((s[j + 1] & 0x3F) as u32),
+                2usize,
+            )
+        } else {
+            return None;
+        };
+        let byte = cp_to_byte(cp)?;
+        if n >= out.len() {
+            return None;
+        }
+        out[n] = byte;
+        n += 1;
+        j += used;
+    }
+    Some(n)
+}
