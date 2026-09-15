@@ -51,15 +51,27 @@ def main():
         return d
 
     ok = True
-    r = cmd("HELLO")
-    print(("OK  " if r.startswith("MARKOS/1 READY") else "BAD ") + r)
-    ok &= r.startswith("MARKOS/1 READY")
-    r = cmd("LOAD")
-    print(("OK  " if r.startswith("OK loaded") else "BAD ") + r)
-    ok &= r.startswith("OK loaded")
-
     run_means = []
+    prev_run_ms = 0
     for run in range(runs):
+        # Fresh connection per run: the kernel returns to LISTEN on FIN and
+        # the run boundary then exercises a clean handshake each time.
+        s = socket.create_connection((host, port), timeout=950)
+        f = s.makefile("rwb")
+
+        def cmd(line):
+            f.write(line.encode() + b"\n")
+            f.flush()
+            return f.readline().strip().decode()
+
+        r = cmd("HELLO")
+        print(("OK  " if r.startswith("MARKOS/1 READY") else "BAD ") + r)
+        ok &= r.startswith("MARKOS/1 READY")
+        if run == 0:
+            r = cmd("LOAD")
+            print(("OK  " if r.startswith("OK loaded") else "BAD ") + r)
+            ok &= r.startswith("OK loaded")
+
         f.write(b"GEN 2 hello world\n")
         f.flush()
         wall0 = time.time()
@@ -70,6 +82,8 @@ def main():
                 print("connection closed before GEN_END")
                 sys.exit(1)
             line = line.strip().decode()
+            if line.startswith("#"):
+                continue  # keepalive comment
             if line.startswith("TOK "):
                 fields = dict(p.split("=", 1) for p in line.split()[1:] if "=" in p)
                 step_rows.append((int(fields["g"]), int(fields["id"])))
@@ -93,7 +107,11 @@ def main():
         # the streamed token count.
         st = parse_stats(cmd("STATS"))
         ok &= st.get("gen_tokens", 0) == steps * (run + 1)
-        run_ms = st.get("run_ms", 0)
+        # run_ms accumulates across runs; the per-run delta is what the
+        # client's wall clock covers.
+        run_ms_total = st.get("run_ms", 0)
+        run_ms = run_ms_total - prev_run_ms
+        prev_run_ms = run_ms_total
         drift_ok = run_ms > 0 and abs(wall_ms - run_ms) <= max(2000, run_ms // 2)
         ok &= drift_ok
         print(
@@ -103,6 +121,10 @@ def main():
             f"{'OK' if drift_ok else 'DRIFT'}"
         )
         run_means.append(st.get("mean_gen_ms", 0))
+
+        # Run boundary: close cleanly (kernel FIN -> LISTEN) and reconnect.
+        f.close()
+        s.close()
 
     ok &= all(m > 0 for m in run_means)
     if runs > 1:

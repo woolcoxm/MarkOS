@@ -524,6 +524,9 @@ pub fn gen_stream(payload: &[u8]) {
                 tcp::stream(b"ERR layer\n");
                 return;
             }
+            if l % 8 == 7 {
+                tcp::stream(b"# k\n");
+            }
         }
     }
 
@@ -580,6 +583,9 @@ pub fn gen_stream(payload: &[u8]) {
                 if engine::layer_forward(&vol, &file, ds, l, &geo, n_tok + g, act).is_err() {
                     tcp::stream(b"ERR layer\n");
                     return;
+                }
+                if l % 8 == 7 {
+                    tcp::stream(b"# k\n");
                 }
             }
         }

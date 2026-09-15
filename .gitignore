@@ -1,8 +1,6 @@
 # Build outputs
 *.img
-serial.log
-serial-*.log
-client-*.log
+*.log
 
 # Rust
 /target/
