@@ -253,6 +253,17 @@ test-forward: image-virt $(REAL_IMG)
 	tr -d "\r" < serial-fwd.log | grep -q "^PASS: forward" || { echo "FAIL: forward (no PASS marker)"; tail -5 serial-fwd.log; exit 1; }; \
 	python3 scripts/forward_check.py $(HOME)/.markos-tests/fwd-expected.txt $(HOME)/.markos-tests/fwd-got.txt && echo "PASS: forward pass" || { echo "FAIL: forward pass"; exit 1; }
 
+## Phase 8b acceptance: FULL decode — 28-layer prefill + greedy steps —
+## validated token-for-token against the numpy reference (--gen).
+test-gen: image-virt $(REAL_IMG)
+	$(MAKE) image-virt KERNEL_FEATURES=selftest-gen
+	python3 scripts/forward_ref.py $(MODEL_FILE) $(HOME)/.markos-tests/gen-expected.txt --gen 2
+	bash scripts/kill_qemu.sh; sleep 1; \
+	timeout 540 $(QEMU) $(VIRTFLAGS) -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 > serial-gen.log 2>&1 || true; \
+	tr -d "\r" < serial-gen.log | grep -E "^(TOKS|LFIN|STEP|GEN|PASS: gen)" > $(HOME)/.markos-tests/gen-got.txt || true; \
+	tr -d "\r" < serial-gen.log | grep -q "^PASS: gen" || { echo "FAIL: gen (no PASS marker)"; tail -5 serial-gen.log; exit 1; }; \
+	python3 scripts/forward_check.py $(HOME)/.markos-tests/gen-expected.txt $(HOME)/.markos-tests/gen-got.txt && echo "PASS: generation" || { echo "FAIL: generation"; exit 1; }
+
 ## Pi-2 acceptance (qemu-virt, PSCI): 4 cores online, exact shared counter.
 test-smp: image-virt
 	timeout --preserve-status $(TIMEOUT) $(QEMU) $(VIRTFLAGS) \

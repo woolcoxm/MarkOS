@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Host reference for the Phase 8a forward-pass gate.
+"""Host reference for the Phase 8 forward-pass gates.
 
-Tokenizes a fixed prompt with the GGUF's own Qwen3 (GPT-2-style) BPE, runs
-one decoder layer of the same GGUF in numpy (embedding -> RMSNorm -> q8_0
-matmuls -> per-head q/k RMSNorm -> RoPE -> GQA attention -> FFN SwiGLU),
-and emits the lines the kernel must reproduce (within f32 tolerance).
+Tokenizes a fixed prompt with the GGUF's own Qwen3 (GPT-2-style) BPE and
+runs the model in numpy as the host-side reference for the bare-metal
+engine.
 
-Usage: forward_ref.py <model.gguf> <out.txt>"""
+Modes:
+  (default)     layer-0 stage dump for the test-forward gate
+  --gen [N]     full 28-layer prefill + N greedy steps for the test-gen gate
+
+Usage: forward_ref.py <model.gguf> <out.txt> [--gen [steps]]"""
 import math
 import re
 import struct
@@ -16,12 +19,11 @@ import numpy as np
 
 MAGIC = 0x46554747
 PROMPT = b"hello world"
+GEN_STEPS = 4
 VT_STR, VT_ARR = 8, 9
 
 
 def parse_header(f):
-    """Header walk: kvs of interest, vocab/merges array locations, tensors."""
-
     def u32():
         return struct.unpack("<I", f.read(4))[0]
 
@@ -86,7 +88,6 @@ def parse_header(f):
         offset = u64()
         tensors[name] = (dims, ttype, offset)
 
-    # Tensor offsets are relative to the aligned data section.
     alignment = kvs.get("general.alignment", 32)
     data_start = -(-f.tell() // alignment) * alignment
     return kvs, vocab, merges, tensors, data_start
@@ -186,108 +187,197 @@ def tokenize(f, vocab_off, vocab_n, merges_off, merges_n, text):
 
 def main():
     path, outp = sys.argv[1], sys.argv[2]
+    gen_mode = "--gen" in sys.argv
+    gen_steps = GEN_STEPS
+    if gen_mode:
+        gi = sys.argv.index("--gen")
+        if gi + 1 < len(sys.argv) and sys.argv[gi + 1].isdigit():
+            gen_steps = int(sys.argv[gi + 1])
+
     f = open(path, "rb")
     kvs, vocab, merges, tensors, data_start = parse_header(f)
     if vocab is None or merges is None:
         sys.exit("vocab/merges arrays not found")
 
-    def at(name):
-        return data_start + tensors[name][2]
-
     n_embd = kvs["qwen3.embedding_length"]
     n_heads = kvs["qwen3.attention.head_count"]
     n_kv = kvs["qwen3.attention.head_count_kv"]
     head_dim = kvs["qwen3.attention.key_length"]
+    n_layers = kvs["qwen3.block_count"]
     theta = kvs["qwen3.rope.freq_base"]
     eps = kvs["qwen3.attention.layer_norm_rms_epsilon"]
+
+    def at(name):
+        return data_start + tensors[name][2]
+
+    inv = theta ** (-np.arange(0, head_dim, 2, dtype=np.float64) / head_dim)
+
+    def rope_vec(h, pos):
+        ang = pos * inv
+        cos, sin = np.cos(ang), np.sin(ang)
+        x1, x2 = h[: head_dim // 2], h[head_dim // 2:]
+        return np.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin])
 
     ids = tokenize(f, vocab[0], vocab[1], merges[0], merges[1], PROMPT)
     lines = [f"TOKS prompt={PROMPT.decode()} ids={','.join(map(str, ids))} n_tokens={len(ids)}"]
 
-    k_cache, v_cache = [], []
-    for t, tok in enumerate(ids):
-        dims, ttype, offset = tensors["token_embd.weight"]
-        row_elems = dims[0]
-        x = dequant_q8_0(f, at("token_embd.weight") + tok * (row_elems // 32) * 34, row_elems)
-        emb_rms = math.sqrt(float(np.mean(x * x)))
-        lines.append(
-            f"EMB{t} id={tok} rms={emb_rms:.6e} v={x[0]:.6e},{x[1]:.6e},{x[2]:.6e},{x[3]:.6e}"
-        )
+    emb_dims, _, emb_off = tensors["token_embd.weight"]
+    row_elems = int(emb_dims[0])
 
-        w = vec_f32(f, at("blk.0.attn_norm.weight"), n_embd)
-        n1 = rmsnorm(x, w, eps)
-        lines.append(f"NRM{t} v={n1[0]:.6e},{n1[1]:.6e},{n1[2]:.6e},{n1[3]:.6e}")
+    def embed(tok):
+        return dequant_q8_0(f, at("token_embd.weight") + tok * (row_elems // 32) * 34, row_elems)
 
-        def q8_matvec(name, vec):
-            dims, ttype, offset = tensors[name]
-            n_out, n_in = int(dims[1]), int(dims[0])
-            w = dequant_q8_0(f, at(name), n_out * n_in).reshape(n_out, n_in)
-            return w @ vec
+    def q8_matvec(name, vec):
+        dims, ttype, offset = tensors[name]
+        n_out, n_in = int(dims[1]), int(dims[0])
+        w = dequant_q8_0(f, at(name), n_out * n_in).reshape(n_out, n_in)
+        return w @ vec
 
-        q = q8_matvec("blk.0.attn_q.weight", n1)
-        k = q8_matvec("blk.0.attn_k.weight", n1)
-        v = q8_matvec("blk.0.attn_v.weight", n1)
-
-        qw = vec_f32(f, at("blk.0.attn_q_norm.weight"), head_dim)
-        kw = vec_f32(f, at("blk.0.attn_k_norm.weight"), head_dim)
-        q = q.reshape(n_heads, head_dim)
-        k = k.reshape(n_kv, head_dim)
-        v = v.reshape(n_kv, head_dim)
-        inv = theta ** (-np.arange(0, head_dim, 2, dtype=np.float64) / head_dim)
-        ang = t * inv
-        cos, sin = np.cos(ang), np.sin(ang)
-
-        def rope(h):
-            x1, x2 = h[: head_dim // 2], h[head_dim // 2:]
-            return np.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin])
-
-        # Qwen3 order: per-head RMSNorm FIRST, then RoPE.
-        q = np.stack([rope(rmsnorm(row, qw, eps)) for row in q])
-        k = np.stack([rope(rmsnorm(row, kw, eps)) for row in k])
-        lines.append(
-            f"QK{t} q={q[0][0]:.6e},{q[0][1]:.6e},{q[0][2]:.6e},{q[0][3]:.6e}"
-            f" k={k[0][0]:.6e},{k[0][1]:.6e},{k[0][2]:.6e},{k[0][3]:.6e}"
-        )
-
-        k_cache.append(k)
-        v_cache.append(v)
-
-        attn_out = np.zeros(n_heads * head_dim, dtype=np.float32)
-        probs0 = None
-        for h in range(n_heads):
-            kvh = h // (n_heads // n_kv)
-            scores = np.array(
-                [float(np.dot(q[h], kc[kvh]) / math.sqrt(head_dim)) for kc in k_cache]
+    if not gen_mode:
+        # ---- layer-0 stage dump (test-forward) ----
+        k_cache, v_cache = [], []
+        for t, tok in enumerate(ids):
+            x = embed(tok)
+            emb_rms = math.sqrt(float(np.mean(x * x)))
+            lines.append(
+                f"EMB{t} id={tok} rms={emb_rms:.6e} v={x[0]:.6e},{x[1]:.6e},{x[2]:.6e},{x[3]:.6e}"
             )
-            p = np.exp(scores - scores.max())
-            p = p / p.sum()
-            if h == 0:
-                probs0 = p.copy()
-            o = sum(p[i] * v_cache[i][kvh] for i in range(len(k_cache)))
-            attn_out[h * head_dim:(h + 1) * head_dim] = o
-        lines.append(
-            f"ATT{t} p0={probs0[0]:.6e}"
-            + (f" p1={probs0[1]:.6e}" if len(probs0) > 1 else "")
-            + f" o={attn_out[0]:.6e},{attn_out[1]:.6e},{attn_out[2]:.6e},{attn_out[3]:.6e}"
-        )
+            w = vec_f32(f, at("blk.0.attn_norm.weight"), n_embd)
+            n1 = rmsnorm(x, w, eps)
+            lines.append(f"NRM{t} v={n1[0]:.6e},{n1[1]:.6e},{n1[2]:.6e},{n1[3]:.6e}")
 
-        wo = q8_matvec("blk.0.attn_output.weight", attn_out)
-        mid = x + wo
-        lines.append(f"MID{t} v={mid[0]:.6e},{mid[1]:.6e},{mid[2]:.6e},{mid[3]:.6e}")
+            q = q8_matvec("blk.0.attn_q.weight", n1)
+            k = q8_matvec("blk.0.attn_k.weight", n1)
+            v = q8_matvec("blk.0.attn_v.weight", n1)
+            qw = vec_f32(f, at("blk.0.attn_q_norm.weight"), head_dim)
+            kw = vec_f32(f, at("blk.0.attn_k_norm.weight"), head_dim)
+            q = q.reshape(n_heads, head_dim)
+            k = k.reshape(n_kv, head_dim)
+            v = v.reshape(n_kv, head_dim)
 
-        w2 = vec_f32(f, at("blk.0.ffn_norm.weight"), n_embd)
-        n2 = rmsnorm(mid, w2, eps)
-        gate = q8_matvec("blk.0.ffn_gate.weight", n2)
-        up = q8_matvec("blk.0.ffn_up.weight", n2)
-        act = silu(gate) * up
-        down = q8_matvec("blk.0.ffn_down.weight", act)
-        hid = mid + down
+            def rope(h):
+                return rope_vec(h, t)
+
+            # Qwen3 order: per-head RMSNorm FIRST, then RoPE.
+            q = np.stack([rope(rmsnorm(row, qw, eps)) for row in q])
+            k = np.stack([rope(rmsnorm(row, kw, eps)) for row in k])
+            lines.append(
+                f"QK{t} q={q[0][0]:.6e},{q[0][1]:.6e},{q[0][2]:.6e},{q[0][3]:.6e}"
+                f" k={k[0][0]:.6e},{k[0][1]:.6e},{k[0][2]:.6e},{k[0][3]:.6e}"
+            )
+            k_cache.append(k)
+            v_cache.append(v)
+
+            attn_out = np.zeros(n_heads * head_dim, dtype=np.float32)
+            probs0 = None
+            for h in range(n_heads):
+                kvh = h // (n_heads // n_kv)
+                scores = np.array(
+                    [float(np.dot(q[h], kc[kvh]) / math.sqrt(head_dim)) for kc in k_cache]
+                )
+                p = np.exp(scores - scores.max())
+                p = p / p.sum()
+                if h == 0:
+                    probs0 = p.copy()
+                o = sum(p[i] * v_cache[i][kvh] for i in range(len(k_cache)))
+                attn_out[h * head_dim:(h + 1) * head_dim] = o
+            lines.append(
+                f"ATT{t} p0={probs0[0]:.6e}"
+                + (f" p1={probs0[1]:.6e}" if len(probs0) > 1 else "")
+                + f" o={attn_out[0]:.6e},{attn_out[1]:.6e},{attn_out[2]:.6e},{attn_out[3]:.6e}"
+            )
+            wo = q8_matvec("blk.0.attn_output.weight", attn_out)
+            mid = x + wo
+            lines.append(f"MID{t} v={mid[0]:.6e},{mid[1]:.6e},{mid[2]:.6e},{mid[3]:.6e}")
+            w2 = vec_f32(f, at("blk.0.ffn_norm.weight"), n_embd)
+            n2 = rmsnorm(mid, w2, eps)
+            gate = q8_matvec("blk.0.ffn_gate.weight", n2)
+            up = q8_matvec("blk.0.ffn_up.weight", n2)
+            act_ = silu(gate) * up
+            down = q8_matvec("blk.0.ffn_down.weight", act_)
+            hid = mid + down
+            lines.append(
+                f"HID{t} v={hid[0]:.6e},{hid[1]:.6e},{hid[2]:.6e},{hid[3]:.6e}"
+                f" sum={float(np.sum(hid.astype(np.float64))):.6e}"
+            )
+        lines.append("PASS: forward")
+    else:
+        # ---- full model: 28-layer prefill + greedy generation (test-gen) ----
+        n_pos = 0
+        kc = [[] for _ in range(n_layers)]  # per layer: (n_kv, head_dim) per position
+        vc = [[] for _ in range(n_layers)]
+        cur_ids = list(ids)
+        gen = []
+        fin_norm = vec_f32(f, at("output_norm.weight"), n_embd)
+        gen_logit0 = None
+
+        def run_token(tok):
+            """One position through all layers; returns final hidden."""
+            x = embed(tok)
+            for L in range(n_layers):
+                w = vec_f32(f, at(f"blk.{L}.attn_norm.weight"), n_embd)
+                n1 = rmsnorm(x, w, eps)
+                q = q8_matvec(f"blk.{L}.attn_q.weight", n1)
+                k = q8_matvec(f"blk.{L}.attn_k.weight", n1)
+                v = q8_matvec(f"blk.{L}.attn_v.weight", n1)
+                qw = vec_f32(f, at(f"blk.{L}.attn_q_norm.weight"), head_dim)
+                kw = vec_f32(f, at(f"blk.{L}.attn_k_norm.weight"), head_dim)
+                q = q.reshape(n_heads, head_dim)
+                k = k.reshape(n_kv, head_dim)
+                v = v.reshape(n_kv, head_dim)
+
+                def rope(h):
+                    return rope_vec(h, n_pos)
+
+                q = np.stack([rope(rmsnorm(row, qw, eps)) for row in q])
+                k = np.stack([rope(rmsnorm(row, kw, eps)) for row in k])
+                kc[L].append(k)
+                vc[L].append(v)
+                attn_out = np.zeros(n_heads * head_dim, dtype=np.float32)
+                for h in range(n_heads):
+                    kvh = h // (n_heads // n_kv)
+                    scores = np.array(
+                        [
+                            float(np.dot(q[h], kc[L][p][kvh]) / math.sqrt(head_dim))
+                            for p in range(len(kc[L]))
+                        ]
+                    )
+                    p = np.exp(scores - scores.max())
+                    p = p / p.sum()
+                    o = sum(p[i] * vc[L][i][kvh] for i in range(len(kc[L])))
+                    attn_out[h * head_dim:(h + 1) * head_dim] = o
+                wo = q8_matvec(f"blk.{L}.attn_output.weight", attn_out)
+                mid = x + wo
+                w2 = vec_f32(f, at(f"blk.{L}.ffn_norm.weight"), n_embd)
+                n2 = rmsnorm(mid, w2, eps)
+                gate = q8_matvec(f"blk.{L}.ffn_gate.weight", n2)
+                up = q8_matvec(f"blk.{L}.ffn_up.weight", n2)
+                act_ = silu(gate) * up
+                down = q8_matvec(f"blk.{L}.ffn_down.weight", act_)
+                x = mid + down
+            return x
+
+        # Prefill: prompt positions 0..len-1.
+        for tok in cur_ids:
+            hid = run_token(tok)
+            n_pos += 1
         lines.append(
-            f"HID{t} v={hid[0]:.6e},{hid[1]:.6e},{hid[2]:.6e},{hid[3]:.6e}"
+            f"LFIN v={hid[0]:.6e},{hid[1]:.6e},{hid[2]:.6e},{hid[3]:.6e}"
             f" sum={float(np.sum(hid.astype(np.float64))):.6e}"
         )
+        # Greedy steps from the last prompt position.
+        for g in range(gen_steps):
+            hf = rmsnorm(hid, fin_norm, eps)
+            # Tied embeddings: lm_head == token_embd.weight.
+            logits = q8_matvec("token_embd.weight", hf)
+            top = int(np.argmax(logits))
+            lines.append(f"STEP{g} tok={top} logit={float(logits[top]):.6e}")
+            gen.append(top)
+            hid = run_token(top)
+            n_pos += 1
+        lines.append(f"GEN ids={','.join(map(str, gen))} n={len(gen)}")
+        lines.append("PASS: gen")
 
-    lines.append("PASS: forward")
     open(outp, "w").write("\n".join(lines) + "\n")
     print("\n".join(lines))
 

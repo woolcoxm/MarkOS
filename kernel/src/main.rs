@@ -199,6 +199,8 @@ extern "C" fn kmain() -> ! {
     selftest_model();
     #[cfg(feature = "selftest-forward")]
     selftest_forward();
+    #[cfg(feature = "selftest-gen")]
+    selftest_gen();
     #[cfg(feature = "selftest-pcie")]
     selftest_pcie();
 
@@ -999,6 +1001,173 @@ fn selftest_forward() -> ! {
         ));
     }
     uart::locked_write(format_args!("PASS: forward\n"));
+    psci::system_off()
+}
+
+/// Phase 8b acceptance: FULL model decode — 28-layer prefill of the
+/// tokenized prompt, final norm, tied-embedding lm_head argmax, and 4
+/// greedy steps — validated token-for-token against the numpy reference
+/// (scripts/forward_ref.py --gen).
+#[cfg(feature = "selftest-gen")]
+fn selftest_gen() -> ! {
+    const META_LEN: usize = 8 * 1024 * 1024;
+    static mut META_BUF: [u8; META_LEN] = [0u8; META_LEN];
+    const GEN_STEPS: usize = 2;
+    const PROMPT: &[u8] = b"hello world";
+
+    uart::write_str("selftest: full decode\n");
+    if let Err(e) = virtio_blk::init() {
+        uart::locked_write(format_args!("FAIL: virtio init: {e}\n"));
+        park()
+    }
+    let vol = match fat::mount() {
+        Ok(v) => v,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: fat mount: {e}\n"));
+            park()
+        }
+    };
+    let file = match vol.open_model() {
+        Ok(f) => f,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: open model: {e}\n"));
+            park()
+        }
+    };
+    let n = {
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut((&raw mut META_BUF) as *mut u8, META_LEN)
+        };
+        match vol.read_at(&file, 0, buf) {
+            Ok(n) => n,
+            Err(e) => {
+                uart::locked_write(format_args!("FAIL: metadata read: {e}\n"));
+                park()
+            }
+        }
+    };
+    let meta = unsafe {
+        core::slice::from_raw_parts((&raw const META_BUF) as *const u8, n)
+    };
+    let info = match gguf::parse_and_dump(meta) {
+        Ok(i) => i,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: gguf parse: {e}\n"));
+            park()
+        }
+    };
+    let geo = match engine::geometry() {
+        Ok(g) => g,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: geometry: {e}\n"));
+            park()
+        }
+    };
+
+    let mut ids = [0u32; engine::MAX_TOKENS];
+    let n_tok = match engine::tokenize(meta, PROMPT, &mut ids) {
+        Ok(n) => n,
+        Err(e) => {
+            uart::locked_write(format_args!("FAIL: tokenize: {e}\n"));
+            park()
+        }
+    };
+    uart::locked_write(format_args!(
+        "TOKS prompt={} ids=",
+        core::str::from_utf8(PROMPT).unwrap_or("?")
+    ));
+    for (i, id) in ids.iter().take(n_tok).enumerate() {
+        if i > 0 {
+            uart::write_byte(b',');
+        }
+        uart::locked_write(format_args!("{id}"));
+    }
+    uart::locked_write(format_args!(" n_tokens={n_tok}\n"));
+
+    let ds = info.data_start;
+    let Some((_, emb_dims, _, emb_off)) = gguf::find_tensor(b"token_embd.weight") else {
+        uart::write_str("FAIL: token_embd.weight\n");
+        park()
+    };
+    let row_elems = emb_dims[0] as usize;
+    let emb_abs = ds + emb_off;
+    let vocab = emb_dims[1] as u64;
+    let Some((_, _, _, fin_off)) = gguf::find_tensor(b"output_norm.weight") else {
+        uart::write_str("FAIL: output_norm.weight\n");
+        park()
+    };
+    let fin_abs = ds + fin_off;
+
+    let act = engine::activations_mut();
+    let mut gen_ids = [0u32; GEN_STEPS];
+
+    // Prefill: prompt positions 0..n_tok.
+    for pos in 0..n_tok {
+        let row = emb_abs + (ids[pos] as u64) * (row_elems / 32 * 34) as u64;
+        if engine::dequant_q8_0_row(&vol, &file, row, row_elems, &mut act.x[..geo.n_embd])
+            .is_err()
+        {
+            uart::write_str("FAIL: embed\n");
+            park()
+        }
+        for l in 0..geo.n_layers as usize {
+            if engine::layer_forward(&vol, &file, ds, l, &geo, pos, act).is_err() {
+                uart::write_str("FAIL: layer\n");
+                park()
+            }
+        }
+    }
+
+    let mut lsum = 0f64;
+    for i in 0..geo.n_embd {
+        lsum += act.x[i] as f64;
+    }
+    uart::locked_write(format_args!(
+        "LFIN v={:.6e},{:.6e},{:.6e},{:.6e} sum={lsum:.6e}
+",
+        act.x[0], act.x[1], act.x[2], act.x[3]
+    ));
+
+    // Greedy generation from the last prompt position.
+    for g in 0..GEN_STEPS {
+        let _ = engine::rmsnorm_with_weight(
+            &vol, &file, fin_abs, &act.x[..geo.n_embd], &mut act.n1[..geo.n_embd], geo.eps,
+        );
+        let Ok((tok, logit)) =
+            engine::argmax_q8_0(&vol, &file, emb_abs, row_elems, vocab, &act.n1[..geo.n_embd])
+        else {
+            uart::write_str("FAIL: lm_head\n");
+            park()
+        };
+        gen_ids[g] = tok;
+        uart::locked_write(format_args!("STEP{g} tok={tok} logit={logit:.6e}\n"));
+        if g + 1 < GEN_STEPS {
+            let row = emb_abs + (tok as u64) * (row_elems / 32 * 34) as u64;
+            if engine::dequant_q8_0_row(&vol, &file, row, row_elems, &mut act.x[..geo.n_embd])
+                .is_err()
+            {
+                uart::write_str("FAIL: embed\n");
+                park()
+            }
+            let pos = n_tok + g;
+            for l in 0..geo.n_layers as usize {
+                if engine::layer_forward(&vol, &file, ds, l, &geo, pos, act).is_err() {
+                    uart::write_str("FAIL: layer\n");
+                    park()
+                }
+            }
+        }
+    }
+
+    uart::locked_write(format_args!("GEN ids="));
+    for (i, g) in gen_ids.iter().enumerate() {
+        if i > 0 {
+            uart::write_byte(b',');
+        }
+        uart::locked_write(format_args!("{g}"));
+    }
+    uart::locked_write(format_args!(" n={GEN_STEPS}\n"));
+    uart::locked_write(format_args!("PASS: gen\n"));
     psci::system_off()
 }
 

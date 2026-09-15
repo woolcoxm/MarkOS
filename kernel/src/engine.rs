@@ -55,6 +55,14 @@ pub fn f16_to_f32(h: u16) -> f32 {
 /// expf for moderate arguments (|x| < 80): 2^k * exp(r) with a degree-6
 /// Taylor on |r| <= ln2/2 — ~1 ulp against the host's math.exp in f32.
 fn expf(x: f32) -> f32 {
+    // Range guards: beyond +-88 the 2^k bit construction over/underflows.
+    // silu relies on exp(-large) -> 0 and exp(+large) -> inf saturating.
+    if x > 88.0 {
+        return f32::INFINITY;
+    }
+    if x < -100.0 {
+        return 0.0;
+    }
     const LN2: f32 = 0.693_147_2;
     const INV_LN2: f32 = 1.442_695;
     let k = fround32(x * INV_LN2);
@@ -624,4 +632,308 @@ pub fn tokenize(
         }
     }
     Ok(n_ids)
+}
+
+// ===== full-model decode (Phase 8b) =====
+
+pub const MAX_POS: usize = 8; // cached positions for the gate
+const MAX_KV_DIM: usize = 1024; // n_kv * head_dim (8 * 128)
+const MAX_LAYERS: usize = 32;
+
+/// Per-layer KV cache: row = layer * MAX_POS + pos.
+/// Soundness: BSP-only scratch, as the rest of the engine buffers.
+static mut KCACHE: [[f32; MAX_KV_DIM]; MAX_LAYERS * MAX_POS] =
+    [[0.0; MAX_KV_DIM]; MAX_LAYERS * MAX_POS];
+static mut VCACHE: [[f32; MAX_KV_DIM]; MAX_LAYERS * MAX_POS] =
+    [[0.0; MAX_KV_DIM]; MAX_LAYERS * MAX_POS];
+
+/// Write "blk.<layer><suffix>" into `buf`, return the name slice.
+fn blk_name<'a>(buf: &'a mut [u8], layer: usize, suffix: &[u8]) -> &'a [u8] {
+    const P: &[u8] = b"blk.";
+    buf[..4].copy_from_slice(P);
+    let mut i = 4;
+    let mut v = layer;
+    if v == 0 {
+        buf[i] = b'0';
+        i += 1;
+    } else {
+        let mut d = [0u8; 8];
+        let mut n = 0usize;
+        while v > 0 {
+            d[n] = b'0' + (v % 10) as u8;
+            n += 1;
+            v /= 10;
+        }
+        while n > 0 {
+            n -= 1;
+            buf[i] = d[n];
+            i += 1;
+        }
+    }
+    buf[i..i + suffix.len()].copy_from_slice(suffix);
+    i += suffix.len();
+    &buf[..i]
+}
+
+/// One transformer layer over the residual stream `act.x` at `pos`.
+/// K/V for this (layer, pos) land in the static cache.
+pub fn layer_forward(
+    vol: &FatVolume,
+    file: &File,
+    ds: u64,
+    layer: usize,
+    geo: &Geometry,
+    pos: usize,
+    act: &mut Activations,
+) -> Result<(), &'static str> {
+    let n_embd = geo.n_embd;
+    let hd = geo.head_dim;
+    let kv_dim = geo.n_kv * hd;
+    if kv_dim > MAX_KV_DIM || layer >= MAX_LAYERS || pos >= MAX_POS {
+        return Err("layer: geometry exceeds cache");
+    }
+
+    let mut nm = [0u8; 48];
+    let norm_abs = ds
+        + gguf::find_tensor(blk_name(&mut nm, layer, b".attn_norm.weight"))
+            .ok_or("layer: missing attn_norm")?
+            .3;
+    rmsnorm_with_weight(vol, file, norm_abs, &act.x[..n_embd], &mut act.n1[..n_embd], geo.eps)?;
+
+    for (suffix, out) in [
+        (&b".attn_q.weight"[..], &mut act.q[..]),
+        (&b".attn_k.weight"[..], &mut act.k[..]),
+        (&b".attn_v.weight"[..], &mut act.v[..]),
+    ] {
+        let nm2 = blk_name(&mut nm, layer, suffix);
+        let Some((_, dims, _, off)) = gguf::find_tensor(nm2) else {
+            return Err("layer: missing projection");
+        };
+        matvec_q8_0(
+            vol,
+            file,
+            ds + off,
+            dims[0] as usize,
+            dims[1] as usize,
+            &act.n1[..n_embd],
+            out,
+        )?;
+    }
+
+    let qw_abs = ds
+        + gguf::find_tensor(blk_name(&mut nm, layer, b".attn_q_norm.weight"))
+            .ok_or("layer: missing q_norm")?
+            .3;
+    let kw_abs = ds
+        + gguf::find_tensor(blk_name(&mut nm, layer, b".attn_k_norm.weight"))
+            .ok_or("layer: missing k_norm")?
+            .3;
+    let mut qw = [0f32; MAX_KV_DIM];
+    let mut kw = [0f32; MAX_KV_DIM];
+    read_f32_vec(vol, file, qw_abs, hd, &mut qw[..hd])?;
+    read_f32_vec(vol, file, kw_abs, hd, &mut kw[..hd])?;
+    head_norm_rope(
+        &mut act.q[..geo.n_heads * hd],
+        geo.n_heads,
+        hd,
+        &qw[..hd],
+        geo.eps,
+        pos,
+        geo.theta,
+    );
+    head_norm_rope(
+        &mut act.k[..kv_dim],
+        geo.n_kv,
+        hd,
+        &kw[..hd],
+        geo.eps,
+        pos,
+        geo.theta,
+    );
+
+    let row = layer * MAX_POS + pos;
+    // Soundness: static KV cache, exclusive BSP access during the pass.
+    unsafe {
+        KCACHE[row][..kv_dim].copy_from_slice(&act.k[..kv_dim]);
+        VCACHE[row][..kv_dim].copy_from_slice(&act.v[..kv_dim]);
+    }
+
+    // Causal attention over cached positions 0..=pos.
+    let scale = 1.0 / fsqrt32(hd as f32);
+    let q_per_kv = geo.n_heads / geo.n_kv;
+    for h in 0..geo.n_heads {
+        let kvh = h / q_per_kv;
+        let mut max = f32::MIN;
+        let mut scores = [0f32; MAX_POS];
+        for p in 0..=pos {
+            let krow = layer * MAX_POS + p;
+            let mut dot = 0f32;
+            let krow_slice = unsafe {
+                core::slice::from_raw_parts(
+                    (&raw const KCACHE[krow]) as *const f32,
+                    MAX_KV_DIM,
+                )
+            };
+            for i in 0..hd {
+                dot += act.q[h * hd + i] * krow_slice[kvh * hd + i];
+            }
+            let s = dot * scale;
+            scores[p] = s;
+            if s > max {
+                max = s;
+            }
+        }
+        let mut sum = 0f32;
+        for p in 0..=pos {
+            scores[p] = expf(scores[p] - max);
+            sum += scores[p];
+        }
+        let inv = 1.0 / sum;
+        for i in 0..hd {
+            let mut acc = 0f32;
+            for p in 0..=pos {
+                let vrow = layer * MAX_POS + p;
+                let vrow_slice = unsafe {
+                    core::slice::from_raw_parts(
+                        (&raw const VCACHE[vrow]) as *const f32,
+                        MAX_KV_DIM,
+                    )
+                };
+                acc += scores[p] * inv * vrow_slice[kvh * hd + i];
+            }
+            act.attn[h * hd + i] = acc;
+        }
+    }
+
+    let (o_abs, o_dims, _) = {
+        let nm2 = blk_name(&mut nm, layer, b".attn_output.weight");
+        let Some((_, dims, _, off)) = gguf::find_tensor(nm2) else {
+            return Err("layer: missing attn_output");
+        };
+        (ds + off, dims, ())
+    };
+    matvec_q8_0(
+        vol,
+        file,
+        o_abs,
+        o_dims[0] as usize,
+        o_dims[1] as usize,
+        &act.attn[..o_dims[0] as usize],
+        &mut act.mid[..o_dims[1] as usize],
+    )?;
+    for i in 0..n_embd {
+        act.mid[i] += act.x[i];
+    }
+
+    let fn_abs = ds
+        + gguf::find_tensor(blk_name(&mut nm, layer, b".ffn_norm.weight"))
+            .ok_or("layer: missing ffn_norm")?
+            .3;
+    rmsnorm_with_weight(vol, file, fn_abs, &act.mid[..n_embd], &mut act.n1[..n_embd], geo.eps)?;
+
+    let (g_abs, g_dims) = {
+        let nm2 = blk_name(&mut nm, layer, b".ffn_gate.weight");
+        let Some((_, dims, _, off)) = gguf::find_tensor(nm2) else {
+            return Err("layer: missing ffn_gate");
+        };
+        (ds + off, dims)
+    };
+    let u_abs = ds
+        + gguf::find_tensor(blk_name(&mut nm, layer, b".ffn_up.weight"))
+            .ok_or("layer: missing ffn_up")?
+            .3;
+    let (d_abs, d_dims) = {
+        let nm2 = blk_name(&mut nm, layer, b".ffn_down.weight");
+        let Some((_, dims, _, off)) = gguf::find_tensor(nm2) else {
+            return Err("layer: missing ffn_down");
+        };
+        (ds + off, dims)
+    };
+    let n_ff = g_dims[1] as usize;
+    matvec_q8_0(
+        vol,
+        file,
+        g_abs,
+        g_dims[0] as usize,
+        n_ff,
+        &act.n1[..n_embd],
+        &mut act.gate[..n_ff],
+    )?;
+    matvec_q8_0(
+        vol,
+        file,
+        u_abs,
+        g_dims[0] as usize,
+        n_ff,
+        &act.n1[..n_embd],
+        &mut act.up[..n_ff],
+    )?;
+    silu(&mut act.gate[..n_ff]);
+    for i in 0..n_ff {
+        act.gate[i] *= act.up[i];
+    }
+    matvec_q8_0(
+        vol,
+        file,
+        d_abs,
+        d_dims[0] as usize,
+        d_dims[1] as usize,
+        &act.gate[..d_dims[0] as usize],
+        &mut act.hid[..d_dims[1] as usize],
+    )?;
+    // Residual: x_out = mid (x + attn) + down. Assignment, not +=: act.x
+    // still holds the layer input here, and mid already includes it.
+    for i in 0..n_embd {
+        act.x[i] = act.mid[i] + act.hid[i];
+    }
+    Ok(())
+}
+
+/// Greedy argmax over a q8_0 matrix's rows (tied lm_head): returns
+/// (row index, logit). Ties resolve to the first row.
+pub fn argmax_q8_0(
+    vol: &FatVolume,
+    file: &File,
+    abs: u64,
+    n_in: usize,
+    n_rows: u64,
+    x: &[f32],
+) -> Result<(u32, f32), &'static str> {
+    let row_bytes = n_in / 32 * 34;
+    if row_bytes == 0 || row_bytes > W_CHUNK_LEN {
+        return Err("argmax: row too large");
+    }
+    let chunk_rows = W_CHUNK_LEN / row_bytes;
+    let n_blk = n_in / 32;
+    let chunk = unsafe {
+        core::slice::from_raw_parts_mut((&raw mut W_CHUNK) as *mut u8, W_CHUNK_LEN)
+    };
+    let mut best_i = 0u32;
+    let mut best_v = f32::MIN;
+    let mut done = 0u64;
+    while done < n_rows {
+        let rows = (chunk_rows as u64).min(n_rows - done) as usize;
+        vol.read_at(
+            file,
+            abs + done * row_bytes as u64,
+            &mut chunk[..rows * row_bytes],
+        )?;
+        for r in 0..rows {
+            let rb = &chunk[r * row_bytes..(r + 1) * row_bytes];
+            let mut acc = 0f32;
+            for b in 0..n_blk {
+                let blk = &rb[b * 34..b * 34 + 34];
+                let s = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                for j in 0..32 {
+                    acc += x[b * 32 + j] * s * ((blk[2 + j] as i8) as f32);
+                }
+            }
+            if acc > best_v {
+                best_v = acc;
+                best_i = done as u32 + r as u32;
+            }
+        }
+        done += rows as u64;
+    }
+    Ok((best_i, best_v))
 }
