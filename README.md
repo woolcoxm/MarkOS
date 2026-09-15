@@ -98,11 +98,18 @@ onto the installer-built SD image with the stock Pi firmware blobs.
 - [x] Pi-5 — virtio-net + ARP/IPv4/ICMP + minimal TCP
 - [x] Pi-5b — control protocol: HELLO/STATUS/LOAD/RUN over TCP, token auth
 - [x] Pi-6 — installer: MARKOS.CFG (ip/port/token) baked into SD, enforced at boot
+- [x] Phase 8 — compute kernels: BPE tokenizer, q8_0 streaming matvec,
+      full 28-layer decode — numpy-verified (test-forward / test-gen)
+- [x] Phase 9 — GEN opcode: prompt in, streamed tokens out over TCP
+      (test-gen-net)
 - [x] Pi-7a — LLM8850 research + bare-metal PCIe ECAM enumeration
 - [ ] Pi-7b — AX8850 transport RE → bare-metal axcl-lite → NPU decode
       ([plan](docs/axera-markos-plan.md))
-- [ ] Pi-8 — stats/soak on real hardware; SDHCI for real SD reads;
-      real-hardware validation on Pi 5 16GB
+- [x] Phase 10/11 — tokens/sec + per-token latency in STATS; sustained
+      generation soak with drift bound (test-gensoak); throughput
+      measurement notes in docs/phase10-notes.md
+- [ ] Pi-8 — hardware soak + llama.cpp throughput comparison on the Pi 5;
+      SDHCI for real SD reads; real-hardware validation on Pi 5 16GB
 
 An earlier x86_64 exploration (Limine unikernel, phases 0–3) is preserved on
 the `x86_64-archive` branch for reference; the Pi is now the only target.

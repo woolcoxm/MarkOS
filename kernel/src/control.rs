@@ -28,6 +28,15 @@ static mut MODEL_BUF: [u8; MODEL_CAP] = [0u8; MODEL_CAP];
 static mut META_BUF: [u8; META_CAP] = [0u8; META_CAP];
 static mut META_LEN: usize = 0;
 static mut META_OK: bool = false;
+
+/// Phase 10 observability: served-token accounting, accumulated by the GEN
+/// decode loop on the BSP.
+static mut GEN_TOKENS: u64 = 0;
+static mut GEN_MS: u64 = 0;
+static mut GEN_MS_MIN: u64 = u64::MAX;
+static mut GEN_MS_MAX: u64 = 0;
+/// Full-request wall time (prefill + decode) per GEN, accumulated.
+static mut GEN_RUN_MS: u64 = 0;
 static mut MODEL_BYTES: usize = 0;
 static mut MODEL_TENSORS: u64 = 0;
 static mut DATA_START: u64 = 0;
@@ -164,13 +173,24 @@ fn status(w: &mut BufW) {
 }
 
 /// Observability (brief Phase 10): live health counters for a monitoring
-/// client — uptime, command count, model state, timer tick rate, cores.
+/// client — uptime, command count, model state, timer tick rate, cores,
+/// plus generation throughput: tokens served, total decode ms, throughput
+/// in milli-tokens/sec, and per-token latency mean/min/max.
 fn stats(w: &mut BufW) {
     let (bytes, served) = unsafe { (MODEL_BYTES, SERVED) };
+    let (gen_tokens, gen_ms, gmin, gmax) =
+        unsafe { (GEN_TOKENS, GEN_MS, GEN_MS_MIN, GEN_MS_MAX) };
+    let tps_milli = if gen_ms > 0 { gen_tokens * 1_000_000 / gen_ms } else { 0 };
+    let mean_ms = if gen_tokens > 0 { gen_ms / gen_tokens } else { 0 };
+    let (min_shown, max_shown) = if gen_tokens > 0 { (gmin, gmax) } else { (0, 0) };
+    let run_ms = unsafe { GEN_RUN_MS };
     let _ = fmt::write(
         w,
         format_args!(
-            "OK stats uptime_ms={} tick_hz={} served={served} model_bytes={bytes} cores={}",
+            "OK stats uptime_ms={} tick_hz={} served={served} model_bytes={bytes} cores={} \
+             gen_tokens={gen_tokens} gen_ms={gen_ms} tps_milli={tps_milli} \
+             mean_gen_ms={mean_ms} gen_min_ms={min_shown} gen_max_ms={max_shown} \
+             run_ms={run_ms}",
             timer::uptime_ms(),
             timer::frequency(),
             board::CORE_COUNT
@@ -488,6 +508,7 @@ pub fn gen_stream(payload: &[u8]) {
     }
 
     let act = engine::activations_mut();
+    let t_run = timer::uptime_ms();
 
     // Prefill: prompt positions 0..n_tok through all layers.
     for pos in 0..n_tok {
@@ -506,9 +527,12 @@ pub fn gen_stream(payload: &[u8]) {
         }
     }
 
-    // Greedy steps: norm -> argmax -> stream -> feed back.
+    // Greedy steps: norm -> argmax -> stream -> feed back. Each iteration
+    // is one served token: timer ticks are accumulated for the STATS
+    // tokens/sec and per-token latency fields (Phase 10).
     let mut gen_ids = [0u32; 8];
     for g in 0..steps {
+        let t0 = timer::uptime_ms();
         if engine::rmsnorm_with_weight(
             &vol, &file, fin_abs, &act.x[..geo.n_embd], &mut act.n1[..geo.n_embd], geo.eps,
         )
@@ -559,6 +583,21 @@ pub fn gen_stream(payload: &[u8]) {
                 }
             }
         }
+        let dt = timer::uptime_ms().saturating_sub(t0);
+        unsafe {
+            GEN_TOKENS += 1;
+            GEN_MS += dt;
+            if dt < GEN_MS_MIN {
+                GEN_MS_MIN = dt;
+            }
+            if dt > GEN_MS_MAX {
+                GEN_MS_MAX = dt;
+            }
+        }
+    }
+
+    unsafe {
+        GEN_RUN_MS += timer::uptime_ms().saturating_sub(t_run);
     }
 
     let mut end = [0u8; 96];
