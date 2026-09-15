@@ -1218,19 +1218,20 @@ fn matvec_udot(
             let boff = b * 34;
             let sb = f16_to_f32(u16::from_le_bytes([row[boff], row[boff + 1]]));
             let mut dot = 0f32;
+            let xoff = b * 32; // activation blocks are dense (32 bytes each)
             if dotprod {
                 // Soundness: sdot_block is pure NEON math on in-bounds
                 // blocks of the cached row and the quantized activations.
                 unsafe {
                     dot = sdot_block(
                         row.as_ptr().add(boff + 2),
-                        xq.as_ptr().add(boff),
+                        xq.as_ptr().add(xoff),
                     ) as f32;
                 }
             } else {
                 for j in 0..32 {
                     dot += ((row[boff + 2 + j] as i8) as f32)
-                        * (xq[boff + j] as f32);
+                        * (xq[xoff + j] as f32);
                 }
             }
             acc_f += dot * sb * sx;
