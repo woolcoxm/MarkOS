@@ -288,7 +288,7 @@ test-gen-net: image-virt $(REAL_IMG)
 	python3 scripts/forward_ref.py $(MODEL_FILE) $(HOME)/.markos-tests/gen-expected.txt --gen 2
 	bash scripts/kill_qemu.sh; sleep 1; \
 	timeout 560 $(QEMU) -M virt -cpu cortex-a76 -smp 4 -global virtio-mmio.force-legacy=false -serial stdio -display none -no-reboot -m 2048 -kernel $(VIRT_IMAGE) -drive file=$(REAL_IMG),format=raw,if=none,id=blk0 -device virtio-blk-device,drive=blk0 -device virtio-net-device,netdev=n0 -netdev user,id=n0,hostfwd=tcp:127.0.0.1:8080-:8080 > serial-gennet.log 2>&1 & qpid=$$!; \
-	sleep 4; \
+	sleep 20; \
 	python3 scripts/gen_client.py 127.0.0.1 8080 $(HOME)/.markos-tests/gen-expected.txt --structural > client-gennet.log 2>&1; rc=$$?; cat client-gennet.log; \
 	kill $$qpid 2>/dev/null; \
 	[ $$rc -eq 0 ] && echo "PASS: gen over tcp" || { echo "FAIL: gen over tcp"; exit 1; }
