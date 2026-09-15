@@ -53,7 +53,7 @@ pub fn matmul_scalar(a: &[u8], b: &[u8], c: &mut [i32]) {
 /// Soundness: a/b/c are the module-owned buffers; each core writes only its
 /// own row range; NEON temps v0/v1/v2 are scratch within each asm block.
 #[target_feature(enable = "dotprod")]
-pub unsafe fn matmul_udot_rows(a: &[u8], b: &[u8], c: &mut [i32], m_start: usize, m_end: usize) {
+pub unsafe fn matmul_udot_rows(a: &[u8], b: &[u8], c: &mut [i32], m_start: usize, m_end: usize) { unsafe {
     for m in m_start..m_end {
         for n in 0..N {
             let mut acc = [0u32; 4];
@@ -85,7 +85,7 @@ pub unsafe fn matmul_udot_rows(a: &[u8], b: &[u8], c: &mut [i32], m_start: usize
                 .wrapping_add(acc[2].wrapping_add(acc[3])) as i32;
         }
     }
-}
+}}
 
 /// Pool job: each core computes a contiguous row range of C with the NEON
 /// UDOT path. `arg`/context unused — the descriptors are module statics.

@@ -13,9 +13,8 @@
 //! - DMA coherence: RX buffers are invalidated before CPU reads and the TX
 //!   buffers cleaned before the device reads them (cache.rs).
 
-use core::fmt::Write as _;
 
-use crate::{cache, timer, uart};
+use crate::{cache, uart};
 
 const NET_MMIO_BASE: u64 = 0x0A00_0000;
 const NET_MMIO_STRIDE: u64 = 0x200;
@@ -341,7 +340,7 @@ fn handle_frame(frame: &[u8]) {
 
 // ===== ARP =====
 
-fn handle_arp(frame: &[u8], body: &[u8], src_mac: [u8; 6]) {
+fn handle_arp(frame: &[u8], body: &[u8], _src_mac: [u8; 6]) {
     if body.len() < 28 {
         return;
     }
@@ -435,7 +434,7 @@ fn net_send(frame: &[u8]) {
         TX_NEXT = TX_NEXT.wrapping_add(1);
         TX_FRAME[slot][..frame.len()].copy_from_slice(frame);
         cache::clean_range((&raw const TX_FRAME[slot]) as usize, frame.len());
-        let hdr = (&raw const TX_HDR[slot]) as usize as u64;
+        let _hdr = (&raw const TX_HDR[slot]) as usize as u64;
         let f = (&raw const TX_FRAME[slot]) as usize as u64;
         let q = &raw mut QTX_Q;
         let idx = (*q).avail.idx;
@@ -473,7 +472,7 @@ pub fn ip_send(dst_mac: &[u8; 6], dst_ip: &[u8; 4], proto: u8, payload: &[u8]) {
 }
 
 fn ip_checksum(data: &[u8]) -> [u8; 2] {
-    let mut sum = sum_ones_complement(data);
+    let sum = sum_ones_complement(data);
     let s = !(sum as u16);
     s.to_be_bytes()
 }
