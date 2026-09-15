@@ -9,3 +9,5 @@ client-*.log
 
 # QEMU filter-dump captures
 *.pcap
+__pycache__/
+*.pyc
