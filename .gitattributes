@@ -25,3 +25,8 @@ config_5.txt   text eol=lf
 *.jpg binary
 *.gguf binary
 *.img binary
+
+
+# whole board tree + embedded web assets feed the image build verbatim
+os/board/** text eol=lf
+engine/web/** text eol=lf

@@ -9,3 +9,7 @@
 /os/output
 Cargo.lock.bak
 install.toml
+
+# local flash/diagnostic scaffolding (never ship)
+install-nomodel.toml
+nul
