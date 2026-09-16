@@ -23,7 +23,8 @@ mount_data() {
 	fi
 	mkdir -p /data/state /data/models /data/log
 	mount --bind /data/state /var/lib/markos 2>/dev/null
-	mount --bind /data/log /var/log/markos 2>/dev/null
+	# (No /var/log/markos bind: the dir cannot be created on the RO root;
+	# the engine logs to stderr under s6 supervision.)
 }
 
 # Boot partition: mount by device (LABEL= needs udev/blkid we don't ship).
@@ -55,6 +56,10 @@ if ! writable_root; then
 	mount -t tmpfs -o mode=0755,size=16m tmpfs /run/etc-overlay
 	cp -a /etc/. /run/etc-overlay/ 2>/dev/null
 	mount -o bind /run/etc-overlay /etc
+	# /root must be writable too: S03 drops the provisioned dropbear
+	# authorized_keys into /root/.ssh, and the RO squashfs would eat it.
+	# The squashfs /root ships empty, so a bare tmpfs loses nothing.
+	mount -t tmpfs -o mode=0700,size=1m tmpfs /root
 fi
 
 # Thermal comfort: THP madvise keeps latency predictable during decode.

@@ -19,15 +19,32 @@ GENIMAGE_TMP="${BUILD_DIR}/genimage.tmp"
 cp "${BOARD_DIR}/config_5.txt"  "${BIN_DIR}/config.txt"
 cp "${BOARD_DIR}/cmdline.txt"   "${BIN_DIR}/cmdline.txt"
 
-# Firmware files staged by the rpi-firmware package live under rpi-firmware/.
+# Boot firmware comes from the official Raspberry Pi OS boot environment,
+# not the buildroot rpi-firmware package: even current-package start4.elf
+# wedges 2026-production d0-stepping boards before the kernel runs, while
+# the Pi OS flavor boots them (verified on hardware 2026-09-16). Downloaded
+# once and cached under os/dl/pios-boot.
+PIOS_BOOT="${BOARD_DIR}/../../dl/pios-boot"
+if [ ! -f "${PIOS_BOOT}/start4.elf" ]; then
+	echo "post-image: fetching Raspberry Pi OS boot environment (one-time, cached)"
+	mkdir -p "${PIOS_BOOT}" "${BUILD_DIR}/pios-tmp"
+	curl -sL -o "${BUILD_DIR}/pios-tmp/raspios.img.xz" \
+		"https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2026-09-15/2026-09-15-raspios-trixie-arm64-lite.img.xz"
+	xz -d "${BUILD_DIR}/pios-tmp/raspios.img.xz"
+	BOOT_SECT=$(fdisk -l "${BUILD_DIR}/pios-tmp/raspios.img" | awk '/W95 FAT32/ {print $2; exit}')
+	mcopy -s -o -i "${BUILD_DIR}/pios-tmp/raspios.img@@$((BOOT_SECT * 512))" \
+		"::/start4.elf" "::/fixup4.dat" "::/bootcode.bin" "::/overlays" "${PIOS_BOOT}/"
+	rm -rf "${BUILD_DIR}/pios-tmp"
+fi
+
+# Firmware files staged flat for genimage + the overlays tree (injected
+# after genimage — its vfat node syntax has no recursive directories).
 rm -rf "${BIN_DIR}/firmware-flat"
 mkdir -p "${BIN_DIR}/firmware-flat"
-for f in start4.elf fixup4.dat; do
-	[ -f "${BIN_DIR}/rpi-firmware/$f" ] && cp "${BIN_DIR}/rpi-firmware/$f" "${BIN_DIR}/firmware-flat/"
+for f in start4.elf fixup4.dat bootcode.bin; do
+	[ -f "${PIOS_BOOT}/$f" ] && cp "${PIOS_BOOT}/$f" "${BIN_DIR}/firmware-flat/"
 done
-if [ -d "${BIN_DIR}/rpi-firmware/overlays" ]; then
-	cp -r "${BIN_DIR}/rpi-firmware/overlays" "${BIN_DIR}/firmware-flat/"
-fi
+[ -d "${PIOS_BOOT}/overlays" ] && cp -r "${PIOS_BOOT}/overlays" "${BIN_DIR}/firmware-flat/"
 
 # Rootfs variant decides the genimage layout. Explicit env wins; otherwise
 # auto-detect from what Buildroot produced (the ssd variant's post-image
@@ -67,6 +84,16 @@ esac
 export ROOTFS_A ROOTFS_B ROOTFS_TYPE
 
 rm -rf "${GENIMAGE_TMP}"
+
+# Data filesystem pre-created with GDT growth reserves: genimage's default
+# mkfs leaves far too few reserved-gdt blocks, and first-boot resize2fs
+# dies with "Not enough reserved gdt blocks" when growing 512M to ~1T
+# (observed on hardware). -E resize=<2T> pre-reserves descriptor space so
+# the online grow works. The genimage configs reference this file directly.
+rm -f "${BIN_DIR}/data.ext4"
+truncate -s 512M "${BIN_DIR}/data.ext4"
+mke2fs -q -t ext4 -F -L data -E resize=2000398934016 "${BIN_DIR}/data.ext4"
+
 genimage \
 	--rootpath "${TARGET_DIR}" \
 	--tmppath "${GENIMAGE_TMP}" \
@@ -79,6 +106,14 @@ genimage \
 mkdir -p "${IMAGES_DIR}/markos-provision-template"
 
 IMG="markos-${ROOTFS_VARIANT}.img"
+# genimage's vfat node cannot embed a directory tree: inject overlays into
+# the finished image's boot FAT directly.
+for IMG in markos-sd.img markos-ssd.img; do
+	[ -f "${IMAGES_DIR}/${IMG}" ] || continue
+	mcopy -s -o -i "${IMAGES_DIR}/${IMG}@@1048576" "${BIN_DIR}/firmware-flat/overlays" ::/ 2>/dev/null || true
+done
+IMG="markos-${ROOTFS_VARIANT}.img"
+
 (
 	cd "${IMAGES_DIR}"
 	sha256sum "${IMG}" > "${IMG}.sha256"

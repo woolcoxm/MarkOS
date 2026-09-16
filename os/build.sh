@@ -27,7 +27,7 @@ echo "== MarkOS build (buildroot $BR_VERSION, variant: $VARIANT) =="
 # --- host tool prerequisites ---
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing host tool: $1" >&2; MISSING=1; }; }
 MISSING=0
-for t in make gcc g++ patch perl tar unzip cpio rsync bc wget file cmake; do need "$t"; done
+for t in make gcc g++ patch perl tar unzip cpio rsync bc wget file cmake xz fdisk mcopy; do need "$t"; done
 [ "$MISSING" = "0" ] || { echo "install the Buildroot prerequisites (see docs/build.md)" >&2; exit 1; }
 
 # --- rust for the engine (pinned toolchain; target added if missing) ---

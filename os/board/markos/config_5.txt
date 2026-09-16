@@ -1,8 +1,12 @@
 # MarkOS boot config for Raspberry Pi 5 (BCM2712).
-# Lives on the boot (FAT32) partition next to the firmware.
+# Lives on the boot (FAT32) partition next to the firmware. Style mirrors
+# the official Raspberry Pi OS config — the boot environment is vendored
+# from there (see post-image.sh) and known-good on d0-stepping boards.
 
 kernel=Image
+arm_64bit=1
 disable_overscan=1
+disable_fw_kms_setup=1
 
 # Full 2.4 GHz on all four A76 cores — inference is sustained CPU load.
 arm_boost=1
@@ -17,6 +21,3 @@ dtparam=watchdog=on
 # PCIe for NVMe HATs. Gen 3 is stable on most drives; uncomment on flaky
 # link trains (see docs/recovery.md).
 # dtparam=pciex1_gen=3
-
-# Boot aggressively but deterministically: no silent display, fast boot.
-boot_delay=0

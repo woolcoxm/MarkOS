@@ -1,8 +1,8 @@
 #!/bin/sh
-# S03markos-net — hostname, provisioning leftovers, WiFi, DHCP, IPv4LL rescue.
+# S03markos-net — hostname, provisioning leftovers, WiFi, network config.
 #
-# Persistent network config lives in /data/state (written by the installer's
-# provision file, editable via the web UI):
+# Persistent network config lives in /data/state (adopted from the
+# installer's boot-FAT copy on first boot, editable via the web UI):
 #   net.conf:   MODE=dhcp | MODE=static IP=... GW=... DNS1=... DNS2=... IFACE=eth0|wlan0
 #   wpa_supplicant.conf  (if WiFi; supports WPA2/WPA3-SAE via wpa_supplicant)
 
@@ -39,7 +39,7 @@ if [ -d /etc/dropbear ]; then
 	cp -a /etc/dropbear/. /data/state/dropbear/ 2>/dev/null || true
 fi
 # authorized_keys are provisioned by the installer into /boot/markos/ and
-# copied to root's home on first boot.
+# copied to root's home (tmpfs via S01) on every boot.
 if [ -f /boot/markos/authorized_keys ]; then
 	mkdir -p /root/.ssh
 	cp /boot/markos/authorized_keys /root/.ssh/authorized_keys
@@ -48,16 +48,29 @@ fi
 
 # Keep the provision snapshot on the boot partition: the factory-reset path
 # (GPIO button / web UI trigger) restores /data/state from it.
-if [ -f /boot/markos/provision.env ]; then
+if [ -f /boot/markos/provision.env ] || [ -f /boot/markos/net.conf ]; then
 	mount -o remount,rw /boot 2>/dev/null || true
 	mkdir -p /boot/markos-snapshot
-	cp /boot/markos/provision.env /boot/markos-snapshot/provision.env
+	for f in provision.env net.conf; do
+		[ -f "/boot/markos/$f" ] && cp "/boot/markos/$f" "/boot/markos-snapshot/$f"
+	done
 	sync
 	mount -o remount,ro /boot 2>/dev/null || true
 fi
 
-# 4. loopback + WiFi (if configured) + DHCP + always-on IPv4LL rescue address
+# 4. loopback + WiFi (if configured) + DHCP/static + always-on IPv4LL rescue
 ip link set lo up 2>/dev/null
+
+# First boot: adopt the installer's plan from the boot FAT into persistent
+# state (the engine provisions accounts, not network). Later edits happen
+# in /data/state via the web UI.
+mkdir -p /data/state
+for f in net.conf ssh-enabled; do
+	if [ ! -f "/data/state/$f" ] && [ -f "/boot/markos/$f" ]; then
+		cp "/boot/markos/$f" "/data/state/$f"
+		echo "markos-net: adopted installer $f from /boot/markos" >/dev/console
+	fi
+done
 
 IFACE="eth0"
 MODE="dhcp"
@@ -78,6 +91,11 @@ case "$MODE" in
 		[ -n "$GW" ] && ip route add default via "$GW" dev "$IFACE"
 		echo "nameserver ${DNS1:-1.1.1.1}" > /etc/resolv.conf
 		[ -n "$DNS2" ] && echo "nameserver $DNS2" >> /etc/resolv.conf
+		# Gratuitous ARP: peers + router learn our MAC immediately, and a
+		# conflicting holder of the address answers loudly.
+		command -v arping >/dev/null 2>&1 && \
+			arping -U -c 3 -I "$IFACE" "${IP:-192.168.1.50}" >/dev/null 2>&1 &
+		echo "markos-net: static ${IP:-192.168.1.50}/24 on $IFACE gw ${GW:-none} dns ${DNS1:-1.1.1.1}" >/dev/console
 		;;
 	*)
 		udhcpc -b -i "$IFACE" -p /var/run/udhcpc.pid -x hostname:"$(hostname)" >/dev/null 2>&1 &
@@ -93,6 +111,12 @@ ip addr add 169.254.9.1/16 dev "$IFACE" 2>/dev/null
 MDNS="$(sed -n 's/.*"mdns_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /var/lib/markos/markos.json 2>/dev/null | head -n1)"
 if [ -n "$MDNS" ] && [ -f /etc/avahi/avahi-daemon.conf ]; then
 	sed -i "s/^host-name=.*/host-name=$MDNS/" /etc/avahi/avahi-daemon.conf
+fi
+
+# 6. ACT LED heartbeat: an across-the-room "kernel + init alive" signal
+#    (replaces the default SD-activity blink; restore via trigger "mmc1").
+if [ -w /sys/class/leds/ACT/trigger ]; then
+	echo heartbeat > /sys/class/leds/ACT/trigger 2>/dev/null
 fi
 
 exit 0

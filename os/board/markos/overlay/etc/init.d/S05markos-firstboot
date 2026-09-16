@@ -1,34 +1,49 @@
 #!/bin/sh
 # S05markos-firstboot — grow the data partition to fill the media, once.
-# Keeps model storage isolated (still its own partition) while using the
-# whole disk; runs after the network/provision stages and never blocks boot.
+#
+# Runs DETACHED: busybox init starts the supervised services only after
+# rcS completes, and resize2fs on a large card can run for minutes — the
+# appliance must come up on the network first. Growing the mounted ext4
+# online is safe (kernel-side resize).
+#
+# This buildroot has no sfdisk package symbol; partition 4's sector count
+# is patched directly in the MBR (LE32 at byte offset 506 = entry 4 at
+# 446+3*16, field +12), partx informs the kernel, resize2fs grows the fs.
 
 FLAG=/data/state/.expanded
 [ -e "$FLAG" ] && exit 0
 
 DISK=""
-for cand in /dev/mmcblk0 /dev/nvme0n1 /dev/sda /dev/vda; do
+for cand in /dev/mmcblk0 /dev/vda /dev/nvme0n1 /dev/sda; do
 	if [ -b "$cand" ]; then DISK="$cand"; break; fi
 done
 [ -n "$DISK" ] || exit 0
 
-# Refuse to touch the device we booted from if it's not the media with the
-# data partition label (safety net for exotic setups).
-free_kb=$(sfdisk -F "$DISK" 2>/dev/null | sed -n 's/.*unallocated \([0-9]*\) b.*/\1/p' | head -n1)
-# sfdisk -F prints bytes; busybox/utillinux differ — use parted-free math via
-# sfdisk -l when unsure. Grow only when > 1 GiB seems free (conservative).
-if command -v sfdisk >/dev/null 2>&1; then
-	# Recreate partition 4 in place, extending to end of disk.
-	echo ",+" | sfdisk --no-reread --force -N 4 "$DISK" >/dev/null 2>&1
-	partx -u "$DISK" >/dev/null 2>&1 || true
-	DATA_PART="${DISK}4"
-	[ -b "$DATA_PART" ] || DATA_PART="${DISK}p4"
-	if [ -b "$DATA_PART" ]; then
-		resize2fs "$DATA_PART" >/dev/null 2>&1 && {
+(
+	if command -v resize2fs >/dev/null 2>&1 && command -v partx >/dev/null 2>&1; then
+		BASE="/sys/block/$(basename "$DISK")"
+		TOTAL=$(cat "$BASE/size")
+		P4="${DISK}4"
+		[ -b "$P4" ] || P4="${DISK}p4"
+		START=$(cat "$BASE/$(basename "$P4")/start")
+		COUNT=$((TOTAL - START))
+
+		dd if="$DISK" of=/tmp/mbr.bin bs=512 count=1 >/dev/null 2>&1
+		printf "$(printf '\\%03o\\%03o\\%03o\\%03o' \
+			$((COUNT & 255)) $(((COUNT >> 8) & 255)) \
+			$(((COUNT >> 16) & 255)) $(((COUNT >> 24) & 255)))" > /tmp/cnt.bin
+		dd if=/tmp/cnt.bin of=/tmp/mbr.bin bs=1 seek=506 count=4 conv=notrunc >/dev/null 2>&1
+		dd if=/tmp/mbr.bin of="$DISK" bs=512 count=1 conv=notrunc >/dev/null 2>&1
+		partx -u "$DISK" >/dev/null 2>&1 || true
+
+		if resize2fs "$P4" >/dev/null 2>&1; then
 			touch "$FLAG"
-			echo "markos-firstboot: data partition expanded on $DISK"
-		}
+			echo "markos-firstboot: data partition expanded to $((COUNT / 2048)) MiB on $DISK" >/dev/console
+		else
+			echo "markos-firstboot: resize2fs failed on $P4 (will retry next boot)" >/dev/console
+		fi
+		rm -f /tmp/mbr.bin /tmp/cnt.bin
 	fi
-fi
+) &
 
 exit 0

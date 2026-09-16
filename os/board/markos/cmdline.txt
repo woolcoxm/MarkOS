@@ -1,1 +1,1 @@
-root=PARTUUID=6d61726b-02 rootwait console=tty1 console=ttyAMA10,115200 loglevel=4
+root=PARTUUID=6d61726b-02 rootwait console=tty1 console=ttyAMA10,115200 loglevel=4 panic=10

@@ -6,5 +6,5 @@ exec 2>&1
 while [ ! -f /data/state/ssh-enabled ]; do
 	sleep 10
 done
-# -s: no password logins ever. -w: no root passwords (n/a, belt+braces).
-exec /usr/sbin/dropbear -F -E -s -w -p 22
+# -s: no password logins ever (key-only; root is the only account).
+exec /usr/sbin/dropbear -F -E -s -p 22
