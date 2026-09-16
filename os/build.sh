@@ -43,6 +43,16 @@ if [ ! -d "$BR" ]; then
 	git clone --depth 1 --branch "$BR_VERSION" https://gitlab.com/buildroot.org/buildroot.git "$BR"
 fi
 
+# --- pin integrity hashes for the custom kernel tarball ---
+# BR2_DOWNLOAD_FORCE_CHECK_HASHES=y refuses custom tarballs without a hash
+# entry. Fresh clones lack it (the working tree got it by hand); make the
+# pin reproducible: append if the kernel commit isn't covered yet.
+KERNEL_SHA=4bb240615790ea5bd939484f4595b6952ac94ef4
+KERNEL_TARBALL_SHA256=df2dc37ce2fc3b90333072a901f67b8eb7ee6d887b3d23f71a964ef06a8fd85b
+if ! grep -q "linux-${KERNEL_SHA}.tar.gz" "$BR/linux/linux.hash" 2>/dev/null; then
+	echo "sha256 ${KERNEL_TARBALL_SHA256}  linux-${KERNEL_SHA}.tar.gz" >> "$BR/linux/linux.hash"
+fi
+
 # --- build one variant ---
 build_variant() {
 	V="$1"
