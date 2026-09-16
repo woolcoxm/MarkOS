@@ -68,12 +68,27 @@ pub trait Backend: Send {
 pub mod mock;
 #[cfg(feature = "llama")]
 pub mod llama;
+#[cfg(feature = "axcl")]
+pub mod axcl;
 
 
 /// Construct the production backend for a GGUF file. Used by the model
 /// manager; on non-llama builds this fails at load time with a clear message
 /// (tests use `mock::load` directly).
-#[cfg(feature = "llama")]
+#[cfg(feature = "axcl")]
+pub fn open_gguf(
+    path: &std::path::Path,
+    n_ctx: u64,
+    n_batch: u64,
+    threads: usize,
+    kv: crate::guard::KvQuant,
+    info: BackendInfo,
+    _meta: crate::gguf::GgufMeta,
+) -> Result<Box<dyn Backend>, String> {
+    axcl::load(path, n_ctx, n_batch, threads, kv, info)
+}
+
+#[cfg(all(not(feature = "axcl"), feature = "llama"))]
 pub fn open_gguf(
     path: &std::path::Path,
     n_ctx: u64,
@@ -86,7 +101,7 @@ pub fn open_gguf(
     llama::load(path, n_ctx, n_batch, threads, kv, info)
 }
 
-#[cfg(not(feature = "llama"))]
+#[cfg(not(any(feature = "llama", feature = "axcl")))]
 pub fn open_gguf(
     path: &std::path::Path,
     n_ctx: u64,

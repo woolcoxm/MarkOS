@@ -13,3 +13,6 @@ install.toml
 # local flash/diagnostic scaffolding (never ship)
 install-nomodel.toml
 nul
+
+# Axera runtime vendor tree (unpacked M5Stack axclhost deb)
+os/vendor/

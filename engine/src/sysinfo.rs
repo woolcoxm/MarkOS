@@ -19,6 +19,14 @@ pub struct SystemInfo {
     pub throttling: bool,
     pub cores: usize,
     pub os_name: String,
+    /// Axera M.2 accelerator status (set once at startup).
+    pub accel: Option<crate::accel::AccelStatus>,
+}
+
+static ACCEL: std::sync::Mutex<Option<crate::accel::AccelStatus>> = std::sync::Mutex::new(None);
+
+pub fn set_accel(st: crate::accel::AccelStatus) {
+    *ACCEL.lock().unwrap() = Some(st);
 }
 
 pub fn refresh() {
@@ -78,6 +86,7 @@ pub fn snapshot() -> SystemInfo {
         throttling: soc.map(|t| t >= 80.0).unwrap_or(false),
         cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
         os_name: os_name(),
+        accel: ACCEL.lock().unwrap().clone(),
     }
 }
 

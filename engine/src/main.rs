@@ -1,9 +1,11 @@
 //! markos-engine — the MarkOS inference engine + web UI (one binary, two
 //! listeners: OpenAI-compatible inference API and the admin control plane).
 
+mod accel;
 mod admin;
 mod api;
 mod auth;
+mod axsets;
 mod backend;
 mod config;
 mod gguf;
@@ -201,6 +203,11 @@ fn main() {
         return;
     }
     sysinfo::refresh();
+    // Axera accelerator bootstrap: MUST precede the first llama.cpp use (the
+    // ggml-axcl backend reads its mode switches from the environment once).
+    let accel_status = accel::detect();
+    accel::configure_once(&accel_status);
+    sysinfo::set_accel(accel_status);
     let ctx = match EngineCtx::open(&data_dir) {
         Ok(c) => c,
         Err(e) => {

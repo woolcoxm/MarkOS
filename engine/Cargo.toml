@@ -15,10 +15,16 @@ path = "src/main.rs"
 [features]
 default = ["mock-backend"]
 # Deterministic mock backend for host builds/tests/CI (no model needed).
-# The MarkOS OS image builds with default-features=false, features=["llama","tls"].
+# The MarkOS OS image builds with default-features=false, features=["axcl","tls"]
+# (Axera NPU build) or ["llama","tls"] (plain CPU build).
 mock-backend = []
-# Real tensor backend: llama.cpp/ggml via llama-cpp-2.
+# Real tensor backend: llama.cpp/ggml via llama-cpp-2 (upstream CPU/NEON).
 llama = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2"]
+# Axera NPU backend: the woolcoxm/llama.cpp fork's ggml-axcl (M5Stack
+# LLM-8850 M.2 card). MARKOS_LLAMA_CPP_DIR must point at the fork checkout
+# at build time (see docs/axera.md). Mutually exclusive with `llama` (two
+# llama.cpp static libs cannot coexist in one binary).
+axcl = ["dep:markos-llama-sys", "markos-llama-sys?/axcl"]
 # TLS for the web UI / API (rustls + first-boot self-signed certs).
 tls = ["dep:rustls", "dep:rcgen", "dep:rustls-pemfile"]
 
@@ -31,6 +37,7 @@ minijinja = "2"
 sha2 = "0.10"
 hex = "0.4"
 libc = "0.2"
+markos-llama-sys = { path = "markos-llama-sys", optional = true }
 # default-features = false drops llama-cpp-2's `openmp` default: the Buildroot
 # aarch64 toolchain ships no libgomp, and OpenMP buys nothing on a 4-core
 # appliance (ggml's own thread pool handles the 4 A76 cores).

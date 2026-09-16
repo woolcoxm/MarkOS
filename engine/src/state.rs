@@ -204,6 +204,16 @@ impl EngineCtx {
         let est = guard::estimate_ram(&shape, meta.file_size, n_ctx, cfg.n_batch, cfg.kv_quant);
         let others = self.manager.resident_bytes_excluding(id);
         let available = sysinfo::usable_ram().saturating_sub(others);
+        // accelerator serving ladder for THIS gguf: whole-layer NPU when an
+        // engine set matches its geometry, else per-op/CPU (any gguf loads)
+        let accel_mode = if crate::accel::detect().present {
+            let sets = crate::axsets::scan(&std::path::Path::new(
+                &crate::accel::engines_root(),
+            ));
+            crate::axsets::match_mode(&shape, &sets)
+        } else {
+            crate::axsets::AccelMode::Cpu
+        };
         Ok(serde_json::json!({
             "model": id,
             "n_ctx": n_ctx,
@@ -214,6 +224,7 @@ impl EngineCtx {
             "available_bytes": available,
             "fits": est.total_bytes <= available,
             "resident": self.manager.resident_ids().contains(&id.to_string()),
+            "accel": accel_mode,
         }))
     }
 

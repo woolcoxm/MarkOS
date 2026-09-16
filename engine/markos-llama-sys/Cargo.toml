@@ -1,0 +1,22 @@
+[package]
+name = "markos-llama-sys"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Raw llama.cpp bindings for markos-engine via the Axera GGUF fork (ggml-axcl NPU backend), built from source with a C shim (no struct-by-value FFI)"
+build = "build.rs"
+# NOTE: no `links` key on purpose — llama-cpp-sys-2 already claims `llama`,
+# and cargo rejects two links=llama packages in ONE resolve graph even when
+# only one is ever built. The engine's `axcl` and `llama` features are
+# mutually exclusive (never enable both: duplicate llama.cpp symbols).
+
+[features]
+# GGML_AXCL=ON build against the woolcoxm/llama.cpp fork (Axera branch).
+# Without it the crate is a no-op stub (host builds/tests don't need it).
+axcl = []
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"
+cmake = "0.1"

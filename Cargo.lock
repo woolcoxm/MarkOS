@@ -1551,6 +1551,7 @@ dependencies = [
  "libc",
  "llama-cpp-2",
  "llama-cpp-sys-2",
+ "markos-llama-sys",
  "minijinja",
  "rcgen",
  "rustls",
@@ -1574,6 +1575,14 @@ dependencies = [
  "serde_json",
  "sha2",
  "toml",
+]
+
+[[package]]
+name = "markos-llama-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "cmake",
 ]
 
 [[package]]
