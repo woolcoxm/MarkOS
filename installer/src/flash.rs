@@ -34,16 +34,25 @@ impl std::fmt::Display for FlashError {
 pub fn list_drives() -> Vec<DriveInfo> {
     let mut out = Vec::new();
     #[cfg(target_family = "windows")]
-    for n in 0..16 {
-        let path = format!(r"\\.\PhysicalDrive{n}");
-        if let Ok(mut f) = File::open(&path) {
-            let size = f.seek(SeekFrom::End(0)).unwrap_or(0);
-            if size > 0 {
-                out.push(DriveInfo {
-                    path,
-                    size_bytes: size,
-                    removable_hint: true,
-                });
+    {
+        for n in 0..16 {
+            let path = format!(r"\\.\PhysicalDrive{n}");
+            if let Ok(mut f) = File::open(&path) {
+                let size = f.seek(SeekFrom::End(0)).unwrap_or(0);
+                if size > 0 {
+                    out.push(DriveInfo {
+                        path,
+                        size_bytes: size,
+                        removable_hint: true,
+                    });
+                }
+            }
+        }
+        // Physical-drive handles often refuse std seek/size on modern
+        // Windows; fall back to the storage cmdlet (present since Win8).
+        if out.is_empty() {
+            if let Some(ps) = powershell_get_disks() {
+                out = ps;
             }
         }
     }
@@ -71,6 +80,60 @@ pub fn list_drives() -> Vec<DriveInfo> {
     out
 }
 
+/// Windows fallback enumeration via `Get-Disk` (JSON), dependency-free.
+#[cfg(target_family = "windows")]
+fn powershell_get_disks() -> Option<Vec<DriveInfo>> {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-Disk | Select-Object Number,Size,BusType | ConvertTo-Json -Compress",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    // ConvertTo-Json emits a bare object (not an array) for a single disk.
+    let wrapped = if text.starts_with('[') {
+        text
+    } else {
+        format!("[{text}]")
+    };
+    let v: serde_json::Value = serde_json::from_str(&wrapped).ok()?;
+    let mut disks = Vec::new();
+    for d in v.as_array()? {
+        let n = d.get("Number")?.as_i64()?;
+        let size = d.get("Size")?.as_u64()?;
+        disks.push(DriveInfo {
+            path: format!(r"\\.\PhysicalDrive{n}"),
+            size_bytes: size,
+            removable_hint: true,
+        });
+    }
+    Some(disks)
+}
+
+/// Size of `device` via drive enumeration (Windows fallback — see above).
+fn enumerated_size(device: &str) -> Option<u64> {
+    #[cfg(target_family = "windows")]
+    {
+        powershell_get_disks()?
+            .into_iter()
+            .find(|d| d.path == device)
+            .map(|d| d.size_bytes)
+    }
+    #[cfg(not(target_family = "windows"))]
+    {
+        let _ = device;
+        None
+    }
+}
+
 /// Write `image` onto `device` with 4 MiB chunks and progress callbacks.
 /// `progress` receives (bytes_done, bytes_total). The caller is responsible
 /// for having confirmed the target with the user — this function only
@@ -86,9 +149,14 @@ pub fn flash_image(
         .len();
 
     let mut dst = open_device_for_write(device)?;
+    // Physical-drive handles on Windows reject SetFilePointer(End); fall
+    // back to the Get-Disk enumeration, and if even that fails trust the
+    // caller's target validation rather than refusing the write.
     let dev_size = dst
         .seek(SeekFrom::End(0))
-        .map_err(|e| FlashError::Io(format!("device seek: {e}")))?;
+        .ok()
+        .or_else(|| enumerated_size(device))
+        .unwrap_or(u64::MAX);
     if dev_size < img_size {
         return Err(FlashError::Io(format!(
             "media too small: device is {} bytes, image needs {}",
@@ -121,7 +189,26 @@ pub fn flash_image(
     // OS caches can hold the FAT stale until an eject cycle; best effort.
     rescan_device(device);
 
+    // Card readers flush asynchronously; give the final blocks a moment to
+    // land before read-back (observed: in-process verify sees stale bytes
+    // that are correct seconds later).
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
     if verify {
+        // Read back UNBUFFERED on Windows: a fresh buffered handle can serve
+        // stale cache instead of the just-written media (the write handle
+        // and this one don't share a coherent cache view for raw devices).
+        #[cfg(target_family = "windows")]
+        let mut dst = {
+            use std::os::windows::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .read(true)
+                .share_mode(7)
+                .custom_flags(0x20000000) // FILE_FLAG_NO_BUFFERING — sector-aligned reads below
+                .open(device)
+                .map_err(|e| FlashError::Io(format!("verify open {device}: {e}")))?
+        };
+        #[cfg(not(target_family = "windows"))]
         let mut dst = File::open(device).map_err(|e| FlashError::Io(e.to_string()))?;
         let mut src = File::open(image).map_err(|e| FlashError::Io(e.to_string()))?;
         src.seek(SeekFrom::Start(0)).ok();
@@ -130,13 +217,33 @@ pub fn flash_image(
         let mut b = vec![0u8; 1024 * 1024];
         let mut off = 0u64;
         loop {
+            // Image side defines the block (its final block may be partial);
+            // the device naturally reads more beyond the image end, so read
+            // exactly `na` bytes from it and compare only those.
             let na = read_full(&mut src, &mut a);
-            let nb = read_full(&mut dst, &mut b);
-            if na != nb || a[..na] != b[..nb] {
-                return Err(FlashError::Io(format!("verify mismatch at offset {off}")));
-            }
             if na == 0 {
                 break;
+            }
+            let nb = read_full(&mut dst, &mut b[..na]);
+            let mut matches = nb == na && a[..na] == b[..na];
+            if !matches {
+                // Retry: reader flush latency can serve stale media briefly.
+                for _ in 0..5 {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    dst.seek(SeekFrom::Start(off)).ok();
+                    let n2 = read_full(&mut dst, &mut b[..na]);
+                    matches = n2 == na && b[..na] == a[..na];
+                    if matches {
+                        break;
+                    }
+                }
+                if !matches {
+                    return Err(FlashError::Io(format!(
+                        "verify mismatch at offset {off}: img_len={na} dev_len={nb} img_head={} dev_head={}",
+                        hex_prefix(&a[..na.min(16)]),
+                        hex_prefix(&b[..nb.min(16)])
+                    )));
+                }
             }
             off += na as u64;
         }
@@ -156,14 +263,24 @@ fn read_full(f: &mut File, buf: &mut [u8]) -> usize {
     filled
 }
 
+fn hex_prefix(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join("")
+}
+
 #[cfg(target_family = "windows")]
 fn open_device_for_write(device: &str) -> Result<File, FlashError> {
     use std::os::windows::fs::OpenOptionsExt;
     OpenOptions::new()
         .write(true)
         .read(true)
-        .share_mode(0) // exclusive
-        .custom_flags(0x20000000) // FILE_FLAG_WRITE_THROUGH? (no-buffering 0x0 not used: keep cached+sync)
+        // Shared access: physical drives with mounted volumes are held by
+        // the filesystem driver; exclusive open would sharing-violate. The
+        // batch/GUI path dismounts the volume(s) before we get here.
+        .share_mode(7) // FILE_SHARE_READ | WRITE | DELETE
+        // WRITE_THROUGH commits every write to media synchronously — lazy
+        // write-back left the tail blocks unreadable to the verify pass on
+        // SD readers (observed: media correct, cache stale for 8+ s).
+        .custom_flags(0x80000000) // FILE_FLAG_WRITE_THROUGH
         .open(device)
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied {
