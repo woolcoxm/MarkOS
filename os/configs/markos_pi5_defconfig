@@ -71,6 +71,10 @@ BR2_PACKAGE_LIBGPIOD=y
 BR2_PACKAGE_LIBGPIOD_TOOLS=y
 BR2_PACKAGE_LIBCURL=y
 BR2_PACKAGE_LIBCURL_CURL=y
+# TLS for the model downloader: without a backend, the image's curl speaks
+# plain HTTP only and every HF download fails ("Protocol https not supported").
+BR2_PACKAGE_LIBCURL_MBEDTLS=y
+BR2_PACKAGE_MBEDTLS=y
 BR2_PACKAGE_CA_CERTIFICATES=y
 BR2_PACKAGE_TZDATA=y
 BR2_PACKAGE_BZIP2=y

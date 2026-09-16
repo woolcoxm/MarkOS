@@ -423,8 +423,10 @@ fn add_model(ctx: &Arc<EngineCtx>, req: &Request, out: &mut ResponseOut) {
                 DownloadStatus { url: url2.clone(), state: "running".into(), error: None, file: file2.clone() },
             );
             let tmp = path.with_extension("part");
+            // --cacert: the mbedTLS-backed curl in the image has no compiled
+            // default CA path; point it at the system bundle explicitly.
             let status = match std::process::Command::new("curl")
-                .args(["-fSL", "--retry", "3", "-o"])
+                .args(["-fSL", "--retry", "3", "--cacert", "/etc/ssl/certs/ca-certificates.crt", "-o"])
                 .arg(&tmp)
                 .arg(&url2)
                 .output()
