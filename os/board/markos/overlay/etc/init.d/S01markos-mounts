@@ -22,6 +22,8 @@ mount_data() {
 		}
 	fi
 	mkdir -p /data/state /data/models /data/log
+	# Axera engine sets + per-op matmul engines (populated out of band)
+	mkdir -p /data/axcl/sets /data/axcl/matmul
 	mount --bind /data/state /var/lib/markos 2>/dev/null
 	# (No /var/log/markos bind: the dir cannot be created on the RO root;
 	# the engine logs to stderr under s6 supervision.)

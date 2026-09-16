@@ -1,0 +1,10 @@
+menuconfig BR2_PACKAGE_MARKOS_LLAMA
+	bool "markos-llama (Axera llama.cpp fork source)"
+	help
+	  Source-only package: a pinned checkout of woolcoxm/llama.cpp branch
+	  axera-any-gguf (llama.cpp + the ggml-axcl NPU backend that runs GGUF
+	  weights directly on the AX8850). markos-engine's `axcl` feature
+	  compiles it through cmake (GGML_AXCL=ON) via markos-llama-sys.
+
+	  The commit must be pushed to GitHub for a fresh build machine to
+	  fetch it; bump MARKOS_LLAMA_VERSION when moving the pin.

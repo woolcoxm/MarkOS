@@ -1,3 +1,6 @@
 menu "MarkOS appliance"
 source "$BR2_EXTERNAL_MARKOS_PATH/package/markos-engine/Config.in"
+source "$BR2_EXTERNAL_MARKOS_PATH/package/markos-llama/Config.in"
+source "$BR2_EXTERNAL_MARKOS_PATH/package/axclhost/Config.in"
+source "$BR2_EXTERNAL_MARKOS_PATH/package/axcl-driver/Config.in"
 endmenu

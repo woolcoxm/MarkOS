@@ -1,0 +1,16 @@
+menuconfig BR2_PACKAGE_AXCLHOST
+	bool "axclhost (Axera AXCL runtime)"
+	depends on BR2_aarch64
+	help
+	  Axera AXCL host runtime for the M5Stack LLM-8850 / AX8850 M.2
+	  accelerator card: libaxcl_rt + friends, card firmware
+	  (ax650_card.pac), udev rules and axcl-smi. Sourced from the M5Stack
+	  axclhost deb (3.6.5-m5stack1) — driver/firmware pairs must match the
+	  card, do not mix vendor builds.
+
+	  The runtime files must be vendored at
+	  os/vendor/axclhost-root/ (an unpacked deb root tree). os/build.sh
+	  seeds it from Projects/Axera-refs when present; see docs/axera.md
+	  for manual placement.
+
+	  https://github.com/woolcoxm/Axera-AX8850-GGUF-Support

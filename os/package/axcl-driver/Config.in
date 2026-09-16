@@ -1,0 +1,15 @@
+menuconfig BR2_PACKAGE_AXCL_DRIVER
+	bool "axcl PCIe host driver (kernel modules)"
+	depends on BR2_LINUX_KERNEL
+	depends on BR2_aarch64
+	help
+	  Out-of-tree Axera AXCL PCIe host driver (ax_pcie_host_dev, ax_pcie_msg,
+	  ax_pcie_mmb, axcl_host, ax_pcie_p2p_rc) built against the MarkOS
+	  kernel. Source: AXERA-TECH's axcl_host aarch64 driver deb (V3.6.2,
+	  HF: AXERA-TECH/AXCL) — it ships /usr/src/axcl as a DKMS-style source
+	  tree; we drive its kbuild directly with the Buildroot toolchain.
+
+	  Pairing note (int4lab FINDINGS): driver/firmware versions must be
+	  compatible with the axclhost runtime; the validated appliance stack
+	  is axclhost 3.6.5-m5stack1 + this V3.6.2 driver source + the M5
+	  card pac. If a future driver is needed, bump the deb URL + hash.

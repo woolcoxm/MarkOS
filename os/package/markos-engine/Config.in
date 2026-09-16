@@ -5,14 +5,35 @@ menuconfig BR2_PACKAGE_MARKOS_ENGINE
 	help
 	  MarkOS inference engine: custom serving layer (HTTP/1.1, OpenAI-
 	  compatible API, SSE streaming, admin control plane, embedded web UI,
-	  memory guardrails, model manager). The `llama` cargo feature compiles
-	  the llama.cpp/ggml tensor backend via cmake with Buildroot's
-	  Cortex-A76 cross toolchain (CPU/NEON only — no GPU code path exists).
+	  memory guardrails, model manager). Tensor backends (pick exactly
+	  one): `llama` compiles upstream llama.cpp/ggml for CPU/NEON, `axcl`
+	  compiles the Axera fork's ggml-axcl NPU backend for the M5Stack
+	  LLM-8850 (AX8850) M.2 card — see docs/axera.md.
 
 	  Host build requirements (enforced by os/build.sh): rustup with the
 	  aarch64-unknown-linux-gnu target and host cmake.
 
 if BR2_PACKAGE_MARKOS_ENGINE
+
+choice
+	prompt "tensor backend"
+	default BR2_PACKAGE_MARKOS_ENGINE_LLAMA
+
+config BR2_PACKAGE_MARKOS_ENGINE_LLAMA
+	bool "llama.cpp CPU/NEON (upstream)"
+	help
+	  Upstream llama.cpp via llama-cpp-2. Any GGUF runs on the CPU.
+
+config BR2_PACKAGE_MARKOS_ENGINE_AXCL
+	bool "Axera NPU (ggml-axcl fork)"
+	select BR2_PACKAGE_AXCLHOST
+	select BR2_PACKAGE_MARKOS_LLAMA
+	help
+	  The woolcoxm/llama.cpp fork: whole-layer NPU engines with GGUF
+	  weight patching when an engine set matches the model's geometry;
+	  per-op NPU matmuls or CPU reference otherwise — ANY gguf loads and
+	  answers either way.
+endchoice
 
 config BR2_PACKAGE_MARKOS_ENGINE_TLS
 	bool "enable TLS (rustls) for web UI/API"

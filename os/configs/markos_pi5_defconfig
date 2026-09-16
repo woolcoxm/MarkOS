@@ -82,7 +82,12 @@ BR2_PACKAGE_XZ=y
 
 # --- MarkOS engine (custom serving layer + llama.cpp via cargo) ---
 BR2_PACKAGE_MARKOS_ENGINE=y
+# BR2_PACKAGE_MARKOS_ENGINE_LLAMA is not set
+BR2_PACKAGE_MARKOS_ENGINE_AXCL=y
 BR2_PACKAGE_MARKOS_ENGINE_TLS=y
+BR2_PACKAGE_MARKOS_LLAMA=y
+BR2_PACKAGE_AXCLHOST=y
+BR2_PACKAGE_AXCL_DRIVER=y
 
 # --- image layout (see board/markos/genimage-*.cfg) ---
 # SD variant ships squashfs root (read-only); SSD/NVMe variant ships ext4.

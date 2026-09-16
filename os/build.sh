@@ -77,6 +77,31 @@ build_variant() {
 		BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_MARKOS_PATH)/board/markos/post-image.sh" 2>/dev/null || true
 }
 
+# --- Axera runtime vendoring (axclhost package source) ---
+# The M5Stack axclhost deb (3.6.5-m5stack1) has no stable public URL; the
+# build consumes an unpacked copy at os/vendor/axclhost-root. Seed it from
+# the dev machine's Axera-refs checkout or a local deb when present.
+VENDOR="$HERE/vendor"
+AXCLHOST_DEB_NAMES="$(ls "$HERE"/../Axera-refs/axclhost_3.6.5-m5stack1_arm64.deb "$HOME"/Downloads/axclhost_3.6.5-m5stack1_arm64.deb 2>/dev/null || true)"
+if grep -q "BR2_PACKAGE_AXCLHOST=y" "$HERE/configs/markos_pi5_defconfig" && [ ! -d "$VENDOR/axclhost-root/usr/lib/axcl" ]; then
+	mkdir -p "$VENDOR/axclhost-root"
+	for deb in $AXCLHOST_DEB_NAMES; do
+		echo "== seeding os/vendor/axclhost-root from $(basename "$deb") =="
+		tmp="$(mktemp -d)"
+		ar x "$deb" --outputdir "$tmp" 2>/dev/null || (cd "$tmp" && ar x "$deb")
+		tar --zstd -xf "$tmp"/data.tar.zst -C "$VENDOR/axclhost-root"
+		rm -rf "$tmp"
+		break
+	done
+	[ -d "$VENDOR/axclhost-root/usr/lib/axcl" ] || {
+		echo "axclhost enabled but os/vendor/axclhost-root is missing." >&2
+		echo "Place the unpacked axclhost_3.6.5-m5stack1_arm64.deb root tree there" >&2
+		echo "(see docs/axera.md), or disable BR2_PACKAGE_AXCL_DRIVER/AXCLHOST + the" >&2
+		echo "engine axcl backend for a CPU-only build." >&2
+		exit 1
+	}
+fi
+
 mkdir -p "$OUT"
 case "$VARIANT" in
 	sd|ssd) build_variant "$VARIANT" ;;
