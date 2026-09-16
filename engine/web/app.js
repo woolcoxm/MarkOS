@@ -473,11 +473,10 @@ function renderSystem() {
 (async function init() {
   $("#nav").classList.remove("hidden");
   view.classList.remove("hidden");
-  try {
-    await refreshState();
-    if (!$("#login-overlay").classList.contains("hidden")) showLogin(false);
-    route();
-  } catch (e) {
-    showLogin(true);
-  }
+  await refreshState();
+  // STATE is null when /api/state returned 401 (refreshState swallows it
+  // after api() already showed the overlay) — keep the login overlay up
+  // instead of hiding it and rendering nothing.
+  if (STATE) route();
+  else showLogin(true);
 })();
