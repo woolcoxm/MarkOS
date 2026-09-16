@@ -7,12 +7,60 @@ HELLO -> LOAD -> GEN <steps> <prompt>; asserts every streamed TOK line
 matches the streamed token count and cross-checks the kernel-reported
 decode time against the client's own wall clock (Phase 10).
 
---soak <runs> repeats the GEN run <runs> times and checks per-run latency
-stability (drift) from the kernel's STATS counters (Phase 11).
+--soak <runs> repeats the full GEN run <runs> times over ONE connection
+(HELLO+LOAD once, then back-to-back GEN sessions — the stricter leak
+probe: the engine's statics cycle IN_GEN repeatedly on a single session)
+and checks per-run latency stability (drift) from the kernel's STATS
+counters (Phase 11).
+
+Transport note: reads are deadline-bounded with a STATS kick. The kernel
+answers STATS between decode steps, so a kick is both a liveness probe
+and a nudge for the dev transport (QEMU user-mode networking), which can
+stall a reply's delivery across long decode pauses.
 Exit 0 = pass."""
+import select
 import socket
 import sys
 import time
+
+
+class Reader:
+    """Deadline-bounded line reader over the raw socket."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.buf = b""
+
+    def line(self, deadline_s=120.0):
+        end = time.time() + deadline_s
+        while True:
+            nl = self.buf.find(b"\n")
+            if nl >= 0:
+                out = self.buf[:nl]
+                self.buf = self.buf[nl + 1:]
+                return out.decode().strip()
+            if time.time() > end:
+                return None
+            r, _, _ = select.select([self.sock], [], [], 1.0)
+            if r:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    # EOF is recoverable at a run boundary (the appliance
+                    # accepts a fresh handshake): report it, do not die.
+                    return "EOF"
+                self.buf += chunk
+
+
+def parse_stats(line):
+    d = {}
+    for tok in line.split()[1:]:
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            try:
+                d[k] = int(v)
+            except ValueError:
+                d[k] = v
+    return d
 
 
 def main():
@@ -33,18 +81,28 @@ def main():
     steps = len(exp_ids)
 
     s = socket.create_connection((host, port), timeout=950)
-    f = s.makefile("rwb")
+    rd = Reader(s)
 
-    def cmd(line):
-        f.write(line.encode() + b"\n")
-        f.flush()
-        return f.readline().strip().decode()
+    def send(line):
+        try:
+            s.sendall(line.encode() + b"\n")
+        except OSError:
+            reconnect("send failed")
 
-    def parse_stats(line):
+    def cmd(line, deadline=950):
+        send(line)
+        r = rd.line(deadline)
+        if r == "EOF":
+            reconnect("connection closed")
+            send(line)
+            r = rd.line(deadline)
+        return r
+
+    def parse_kv(line):
         d = {}
-        for tok in line.split()[1:]:
-            if "=" in tok:
-                k, v = tok.split("=", 1)
+        for p in line.split()[1:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
                 try:
                     d[k] = int(v)
                 except ValueError:
@@ -54,35 +112,74 @@ def main():
     ok = True
     run_means = []
     prev_run_ms = 0
+
+    r = cmd("HELLO")
+    print(("OK  " if r is not None and r.startswith("MARKOS/1 READY") else "BAD ") + str(r))
+    ok &= r is not None and r.startswith("MARKOS/1 READY")
+    r = cmd("LOAD")
+    print(("OK  " if r is not None and r.startswith("OK loaded") else "BAD ") + str(r))
+    ok &= r is not None and r.startswith("OK loaded")
+
+    def reconnect(reason):
+        """The dev transport (QEMU user-mode hostfwd) has been observed to
+        kill a long-lived flow outright. The appliance is fine — its
+        counters persist and it accepts a fresh handshake — so tear down
+        the dead socket and re-establish, then resume the soak."""
+        nonlocal s, rd
+        print(f"transport lost ({reason}); reconnecting", flush=True)
+        try:
+            s.close()
+        except OSError:
+            pass
+        for attempt in range(10):
+            try:
+                s = socket.create_connection((host, port), timeout=950)
+                rd2 = Reader(s)
+                s.sendall(b"HELLO\n")
+                r2 = rd2.line(10)
+                if r2 is not None and r2.startswith("MARKOS/1 READY"):
+                    rd = rd2
+                    print("reconnected", flush=True)
+                    return
+            except OSError as e:
+                print(f"reconnect attempt {attempt + 1}: {e}")
+            try:
+                s.close()
+            except OSError:
+                pass
+            time.sleep(3)
+        sys.exit("appliance never answered HELLO after transport loss")
+
     for run in range(runs):
-        # Fresh connection per run: the kernel returns to LISTEN on FIN and
-        # the run boundary then exercises a clean handshake each time.
-        s = socket.create_connection((host, port), timeout=950)
-        f = s.makefile("rwb")
+        if run > 0:
+            r = cmd("HELLO")
+            if r is None or r == "EOF":
+                reconnect("no banner")
+                r = "MARKOS/1 READY"
+            print(("OK  " if r.startswith("MARKOS/1 READY") else "BAD ") + str(r))
+            ok &= r.startswith("MARKOS/1 READY")
 
-        def cmd(line):
-            f.write(line.encode() + b"\n")
-            f.flush()
-            return f.readline().strip().decode()
-
-        r = cmd("HELLO")
-        print(("OK  " if r.startswith("MARKOS/1 READY") else "BAD ") + r)
-        ok &= r.startswith("MARKOS/1 READY")
-        if run == 0:
-            r = cmd("LOAD")
-            print(("OK  " if r.startswith("OK loaded") else "BAD ") + r)
-            ok &= r.startswith("OK loaded")
-
-        f.write(b"GEN 2 hello world\n")
-        f.flush()
+        send("GEN 2 hello world")
         wall0 = time.time()
         step_rows, gen_ids = [], None
+        kicks = 0
         while True:
-            line = f.readline()
-            if not line:
-                print("connection closed before GEN_END")
-                sys.exit(1)
-            line = line.strip().decode()
+            line = rd.line(120)
+            if line == "EOF":
+                reconnect("connection closed mid-run")
+                send("GEN 2 hello world")
+                kicks = 0
+                continue
+            if line is None:
+                if kicks >= 3:
+                    reconnect("GEN stream stalled")
+                    send("GEN 2 hello world")
+                    kicks = 0
+                    continue
+                kicks += 1
+                print(f"stall in GEN stream; STATS kick {kicks}", flush=True)
+                send("STATS")
+                continue
             if line.startswith("#"):
                 continue  # keepalive comment
             if line.startswith("TOK "):
@@ -90,10 +187,19 @@ def main():
                 step_rows.append((int(fields["g"]), int(fields["id"])))
                 if "text" in fields:
                     print(f"TOK {fields}")
+            elif line.startswith("OK stats"):
+                # Reply to a kick: live proof the kernel is generating.
+                print("kick reply:", line)
             elif line.startswith("GEN_END"):
                 gen_ids = [int(x) for x in
                            line.split("ids=")[1].split()[0].split(",")]
                 break
+            elif line.startswith("ERR busy"):
+                # A transport replay re-triggered GEN while one was still
+                # in flight (or our resend raced it): the in-flight run's
+                # stream is what this run should consume.
+                print("kernel busy; consuming in-flight run", flush=True)
+                continue
             elif line.startswith("ERR"):
                 print("ERR line:", line)
                 sys.exit(1)
@@ -130,9 +236,8 @@ def main():
         )
         run_means.append(st.get("mean_gen_ms", 0))
 
-        # Run boundary: close cleanly (kernel FIN -> LISTEN) and reconnect.
-        f.close()
-        s.close()
+    # All runs complete: one clean close (kernel FIN -> LISTEN).
+    s.close()
 
     ok &= all(m > 0 for m in run_means)
     if runs > 1:

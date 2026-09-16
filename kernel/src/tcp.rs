@@ -37,6 +37,15 @@ static mut SND_NXT: u32 = 0;
 static mut RCV_NXT: u32 = 0;
 static ISS: u32 = 0x4D41_524B; // "MARK"
 
+/// Command reassembly (Pi-8 hardening): the peer may split one write
+/// across arbitrarily many segments, so bytes accumulate until a newline
+/// completes a command line. MARKOS-PING (the transport probe) predates
+/// the line protocol and is dispatched as soon as its exact bytes are
+/// buffered.
+const CMD_MAX: usize = 256;
+static mut RCV_BUF: [u8; CMD_MAX] = [0; CMD_MAX];
+static mut RCV_LEN: usize = 0;
+
 const PONG: &[u8] = b"MARKOS-PONG";
 
 /// Entry: a TCP segment arrived (IPv4 payload addressed to us).
@@ -70,19 +79,29 @@ pub fn input(seg: &[u8], src_ip: [u8; 4], src_mac: [u8; 6]) {
             }
         }
         ST_ESTAB => {
-            if flags & FLAG_RST != 0 {
-                // Peer abandoned the connection: free the slot.
-                unsafe { STATE = ST_LISTEN; }
-                uart::write_str("tcp: reset, listening\n");
-                return;
-            }
             if flags & FLAG_SYN != 0 && payload_len == 0 {
-                // A fresh SYN while established means the peer dropped
-                // the old session and its FIN/RST never reached us (the
-                // appliance serves one client at a time, so the newest
-                // handshake wins): reset to it.
+                // A fresh SYN while established means the peer dropped the
+                // old session and its FIN never reached us (the appliance
+                // serves one client at a time, so the newest handshake
+                // wins): reset to it.
                 uart::write_str("tcp: peer re-handshake\n");
                 accept_syn(src_ip, src_mac, src_port, seq);
+                return;
+            }
+            if src_port != peer_port() {
+                // Traffic from a previous connection — e.g. a retransmitted
+                // FIN that lost the race with the next session's SYN (close
+                // then instantly reconnect): it must not touch the live
+                // session's state.
+                return;
+            }
+            if flags & FLAG_RST != 0 {
+                // Peer abandoned the connection: free the slot.
+                unsafe {
+                    STATE = ST_LISTEN;
+                    RCV_LEN = 0;
+                }
+                uart::write_str("tcp: reset, listening\n");
                 return;
             }
             if payload_len > 0 && seq == rcv_nxt_load() {
@@ -96,13 +115,54 @@ pub fn input(seg: &[u8], src_ip: [u8; 4], src_mac: [u8; 6]) {
                 // in-order inside that drain — a frame rejected here is
                 // discarded, which would strand the byte stream.
                 rcv_nxt_store(seq.wrapping_add(payload_len as u32));
-                handle_payload(payload);
+                // Reassemble newline-terminated command lines across
+                // segments; the transport may fragment one write
+                // arbitrarily and dispatching a fragment would run a
+                // truncated command.
+                for &b in payload {
+                    if b == b'\n' {
+                        dispatch_line();
+                    } else {
+                        unsafe {
+                            if RCV_LEN < CMD_MAX {
+                                RCV_BUF[RCV_LEN] = b;
+                                RCV_LEN += 1;
+                            }
+                            // else: oversized line — silently dropped at
+                            // the next newline (no command is this long).
+                        }
+                        // The bare transport probe completes without a
+                        // newline; dispatch it the moment its exact bytes
+                        // are buffered.
+                        let n = unsafe { RCV_LEN };
+                        if n == PONG.len() {
+                            // Soundness: n <= CMD_MAX by the push bound.
+                            let buf = unsafe {
+                                core::slice::from_raw_parts(
+                                    (&raw const RCV_BUF) as *const u8,
+                                    n,
+                                )
+                            };
+                            if buf == PONG {
+                                dispatch_line();
+                            }
+                        }
+                    }
+                }
             } else if payload_len > 0 {
                 // Duplicate/out-of-order: re-acknowledge what we expect.
                 send_ack(rcv_nxt_load());
             }
+            if payload_len > 0 {
+                // Any in-order or duplicate frame from the peer proves the
+                // session alive; note it for the idle timeout.
+                unsafe { LAST_RX_MS = crate::timer::uptime_ms() };
+            }
             if flags & FLAG_FIN != 0 {
-                // Acknowledge their FIN; return to listening.
+                // A bare command (no trailing newline) closed behind its
+                // bytes: dispatch it, then acknowledge their FIN and return
+                // to listening.
+                dispatch_line();
                 send_ack(rcv_nxt_load().wrapping_add(1));
                 unsafe {
                     unsafe { STATE = ST_LISTEN; }
@@ -111,6 +171,30 @@ pub fn input(seg: &[u8], src_ip: [u8; 4], src_mac: [u8; 6]) {
             }
         }
         _ => {}
+    }
+}
+
+/// A session with no inbound traffic for this long is dead — the peer (or
+/// an intermediate transport) dropped it without a FIN/RST. Retire it so
+/// new sessions get through; legitimate clients reconnect seamlessly.
+/// Healthy runs carry inbound frames every few seconds (TCP ACKs for the
+/// streamed tokens alone), so the margin is wide.
+const IDLE_TIMEOUT_MS: u64 = 45_000;
+static mut LAST_RX_MS: u64 = 0;
+
+/// Retire a silently-dead session. Called from the main loop each
+/// iteration (never from inside a long handler, so a busy LOAD or GEN
+/// decode cannot false-trigger it).
+pub fn tick() {
+    if unsafe { STATE } == ST_ESTAB {
+        let idle = crate::timer::uptime_ms().saturating_sub(unsafe { LAST_RX_MS });
+        if idle > IDLE_TIMEOUT_MS {
+            unsafe {
+                STATE = ST_LISTEN;
+                RCV_LEN = 0;
+            }
+            uart::write_str("tcp: idle timeout, listening\n");
+        }
     }
 }
 
@@ -123,10 +207,28 @@ fn accept_syn(src_ip: [u8; 4], src_mac: [u8; 6], src_port: u16, seq: u32) {
         PEER_PORT = src_port;
         SND_NXT = ISS.wrapping_add(1);
         RCV_NXT = seq.wrapping_add(1);
+        // A new session must not inherit the previous one's partial line.
+        RCV_LEN = 0;
+        LAST_RX_MS = crate::timer::uptime_ms();
         STATE = ST_SYN_RCVD;
     }
     // SYN-ACK: seq = ISS, ack = their seq + 1.
     tcp_send_seg(ISS, seq.wrapping_add(1), FLAG_SYN | FLAG_ACK, &[]);
+}
+
+/// Dispatch the reassembled command line and reset the buffer. Empty
+/// buffers and oversized overflows are discarded quietly.
+fn dispatch_line() {
+    let n = unsafe { RCV_LEN };
+    if n > 0 {
+        // Soundness: n <= CMD_MAX by the push bound; the buffer is
+        // BSP-local input scratch for the duration of the dispatch.
+        let line = unsafe {
+            core::slice::from_raw_parts((&raw const RCV_BUF) as *const u8, n)
+        };
+        handle_payload(line);
+    }
+    unsafe { RCV_LEN = 0 };
 }
 
 /// Protocol handler for received payloads: the MARKOS-PING transport probe,

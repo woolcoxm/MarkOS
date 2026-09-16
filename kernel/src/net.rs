@@ -497,6 +497,7 @@ pub fn serve_loop() -> ! {
     let mut beat: u64 = 0;
     loop {
         poll();
+        crate::tcp::tick();
         beat += 1;
         if beat % 4_000_000 == 0 {
             uart::write_str("net: alive
