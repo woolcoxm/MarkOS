@@ -39,6 +39,7 @@ engine is one aarch64 binary. Full rationale: [docs/design.md](docs/design.md#2-
 | `installer/` | markos-installer: egui GUI + scriptable CLI, config validation, **custom FAT32 writer** for config injection, raw-disk flasher (`\\.\PhysicalDriveN`, `/dev/sdX`) |
 | `os/` | Buildroot external tree: defconfig, kernel fragment, board overlay (runit services, firewall, watchdog, first-boot provisioner, recovery, `markos-update`), genimage layouts, `build.sh` |
 | `scripts/make_gguf_test.py` | synthetic GGUF generator (ported from the repo's earlier bare-metal kernel work) |
+| `docs/axera.md` | **Axera AX8850 accelerator support** — the M5Stack LLM-8850 M.2 card: NPU serving ladder, engine sets, driver/runtime packages |
 
 ## Quickstart
 
@@ -221,8 +222,13 @@ build.
 
 ## Design invariants
 
-- **CPU/NEON only.** The VideoCore VII GPU is not a compute target; no GPU
-  code path exists anywhere.
+- **Any GGUF, always.** The engine never rejects a model for lack of an
+  accelerator path: a matching Axera engine set serves it whole-layer on
+  the NPU (24-30 t/s), otherwise per-op NPU matmuls or the CPU reference
+  take over — see [docs/axera.md](docs/axera.md).
+- **CPU/NEON baseline.** The VideoCore VII GPU is not a compute target;
+  no GPU code path exists anywhere. (The Axera M.2 card is an NPU, not a
+  Pi GPU path.)
 - **Guardrails, not crashes.** The engine estimates weights + KV + compute
   buffers from GGUF metadata and refuses loads that would OOM — with numbers,
   in the UI and via HTTP 409.
@@ -249,9 +255,12 @@ build.
 | **USB SSD / NVMe variant (`--variant ssd`)** | **`markos-ssd.img` built (ext4 root + A/B slots + data partition); engine, init stages, s6 services and inittab verified inside the ext4 root by loop-mount** |
 | on-target boot (real Pi 5 16 GB, d0 stepping, 2026 production) | **green on hardware**: Pi OS-derived boot env boots the MarkOS kernel (6.18) + squashfs root; first-boot net.conf adoption (static IP + gratuitous ARP), web UI login + tabs, SSH key auth (root), data partition grown 512 M → 936 G with GDT-reserved fs |
 | on-target behavior (thermal under sustained load, NVMe EEPROM boot order) | requires physical hardware |
+| **Axera AX8850 NPU support** (engine `axcl` feature, ggml-axcl fork with runtime geometry + engine-set manifests; Buildroot driver/runtime packages) | fork cmake build green (WSL x86, GGML_AXCL=ON); 44/44 host tests green incl. set-manifest matching; **on-target (module load on 6.18, NPU decode) pending the next hardware session** — see [docs/axera.md](docs/axera.md) |
 
 ## Non-goals (v1)
 
-No GPU/accelerator path · no multi-Pi clustering (noted as future work in the
-design doc) · no general server dashboard · no telemetry, no auto-updates,
-no runtime dependencies beyond user-initiated model downloads.
+No Pi-GPU path (the Axera M.2 NPU card *is* supported — that's an
+accelerator, not the VideoCore GPU) · no multi-Pi clustering (noted as
+future work in the design doc) · no general server dashboard · no
+telemetry, no auto-updates, no runtime dependencies beyond
+user-initiated model downloads.

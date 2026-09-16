@@ -53,3 +53,11 @@ repo = "bartowski/Qwen3-0.6B-GGUF"
 quant = "Q4_K_M"                  # Q4_K_M | Q5_K_M | Q6_K | Q8_0 | …
 # or a direct file URL instead of repo+quant:
 # url = "https://example.com/model.Q4_K_M.gguf"
+
+# --- accelerator (Axera AX8850 M.2 card, e.g. M5Stack LLM-8850) ---
+# No configuration needed: the engine detects the card on PCIe at boot and
+# arms the NPU path automatically. Whole-layer NPU acceleration applies to
+# models whose geometry matches an installed engine set (/data/axcl/sets);
+# every other GGUF still loads and runs (per-op NPU or CPU). To force a
+# CPU-only boot on a carded box, set MARKOS_AXCL=0 in the engine service
+# environment. See docs/axera.md.
