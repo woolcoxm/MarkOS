@@ -60,7 +60,7 @@ markos-installer --config install.toml.example --image os/output/markos-sd.img \
 ```
 
 **3. Use it**: boot the Pi (27 W USB-C PD, active cooler recommended), open
-`http://pi-inference.local`, add a model (HF repo + quant), hit the API:
+`https://pi-inference.local` (self-signed cert — accept the warning), add a model (HF repo + quant), hit the API:
 
 ```sh
 curl http://pi-inference.local:8080/v1/chat/completions -H 'Content-Type: application/json' \
@@ -178,8 +178,11 @@ display. Writes through the same flasher core.
 4. If you configured a `[model_preseed]`, the engine downloads it on first
    boot — on very large cards that download may race the partition grow and
    fail once; retry from the Models tab a few minutes later.
-5. Open the web UI: `http://<mdns_name>.local`, your static/DHCP address,
-   or `http://10.0.0.x:4444`. Sign in with the admin credentials from your
+5. Open the web UI over **HTTPS**: `https://<mdns_name>.local`, your static/DHCP
+   address, or `https://10.0.0.x:4444`. TLS is on by default with a first-boot
+   self-signed certificate (SANs cover the mDNS name, hostname, and static
+   IP); browsers will show a warning until you trust it. The inference API
+   (`:8080`) stays plain HTTP for LAN clients by design. Sign in with the admin credentials from your
    config. (No credentials are baked in — the provision file is the only
    way an admin comes into existence.)
 6. SSH: `ssh root@<address>` with your configured key — key-only, root,
@@ -188,7 +191,7 @@ display. Writes through the same flasher core.
 ### 6. Recovery paths (always a way back in)
 
 - **Link-local rescue UI**: plug a laptop straight into the Pi's Ethernet
-  port → `http://169.254.9.1:4444`.
+  port → `https://169.254.9.1:4444`.
 - **Factory reset**: hold the GPIO26 button ≥ 3 s during boot — restores
   `/data/state` from the install-time snapshot (models are preserved).
 - **Serial console**: UART on GPIO14/15, 115200 8N1.

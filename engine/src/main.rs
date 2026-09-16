@@ -234,7 +234,13 @@ fn main() {
     };
 
     #[cfg(feature = "tls")]
-    let tls_wrap = tls::wrap_if_enabled(&ctx).ok().flatten();
+    let tls_wrap = match tls::wrap_if_enabled(&ctx) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("markos-engine: TLS init failed, UI falls back to plain HTTP: {e}");
+            None
+        }
+    };
     #[cfg(not(feature = "tls"))]
     let tls_wrap: Option<Arc<dyn http::StreamWrap>> = None;
 

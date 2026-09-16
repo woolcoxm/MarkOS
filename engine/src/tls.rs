@@ -30,10 +30,33 @@ fn ensure_self_signed(ctx: &EngineCtx) -> Result<(Vec<u8>, Vec<u8>), String> {
         let s = ctx.store.read().unwrap();
         s.engine.server.mdns_name.clone()
     };
-    let subject = format!("CN={host}");
-    let mut params = rcgen::CertificateParams::new(vec![host.clone()])
+    // SANs: browsers are reached via mDNS name, hostname, or static IP —
+    // cover all of them so only the self-signed warning ever shows.
+    let mut sans = vec![host.clone(), "localhost".to_string()];
+    if let Ok(h) = std::fs::read_to_string(ctx.data_dir.join("hostname")) {
+        let h = h.trim().to_string();
+        if !h.is_empty() && !sans.contains(&h) {
+            sans.push(h);
+        }
+    }
+    if let Ok(net) = std::fs::read_to_string(ctx.data_dir.join("net.conf")) {
+        for line in net.lines() {
+            if let Some(ip) = line.strip_prefix("IP=") {
+                if let Ok(ip) = ip.trim().parse::<std::net::IpAddr>() {
+                    sans.push(ip.to_string());
+                }
+            }
+        }
+    }
+    sans.push("127.0.0.1".to_string());
+    let dns_names: Vec<_> = sans.iter().filter(|s| s.parse::<std::net::IpAddr>().is_err()).cloned().collect();
+    let ips: Vec<_> = sans.iter().filter_map(|s| s.parse::<std::net::IpAddr>().ok()).collect();
+    let mut params = rcgen::CertificateParams::new(dns_names)
         .map_err(|e| e.to_string())?;
-    params.distinguished_name.push(rcgen::DnType::CommonName, subject);
+    for ip in ips {
+        params.subject_alt_names.push(rcgen::SanType::IpAddress(ip));
+    }
+    params.distinguished_name.push(rcgen::DnType::CommonName, host.clone());
     let key_pair = rcgen::KeyPair::generate().map_err(|e| e.to_string())?;
     let cert = params.self_signed(&key_pair).map_err(|e| e.to_string())?;
     let cert_pem = cert.pem().into_bytes();

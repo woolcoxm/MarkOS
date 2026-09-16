@@ -36,7 +36,7 @@ impl Default for ServerConfig {
         ServerConfig {
             api_bind: "0.0.0.0:8080".into(),
             ui_binds: vec!["0.0.0.0:80".into(), "0.0.0.0:4444".into()],
-            tls_enabled: false,
+            tls_enabled: true, // self-signed cert generated on first boot (engine/src/tls.rs)
             tls_cert_path: None,
             tls_key_path: None,
             api_key_required: false,
