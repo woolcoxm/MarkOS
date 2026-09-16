@@ -1,0 +1,11 @@
+#!/bin/sh
+# S04markos-firewall — nftables, deny-by-default inbound.
+# Allowed: established, loopback, ping, SSH (if running), web UI ports,
+# inference API port, mDNS, IPv4LL. Everything else: dropped.
+
+if ! command -v nft >/dev/null 2>&1; then
+	echo "nftables not present, skipping" >&2
+	exit 0
+fi
+nft -f /etc/nftables.conf
+exit 0

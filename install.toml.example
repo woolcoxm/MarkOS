@@ -1,0 +1,55 @@
+# MarkOS installer configuration — the same surface the GUI edits.
+# Usage:
+#   markos-installer --config install.toml --image markos-sd.img --target sd --out configured.img
+#   markos-installer --config install.toml --image markos-sd.img --write \\.\PhysicalDrive3 --verify
+#
+# Validation rules that REFUSE to proceed:
+#   - boot_media unset
+#   - no way in: no admin password, no SSH key, and no serial console
+#   - admin password shorter than 8 chars, invalid static IP, bad WPA PSK
+
+# --- target media (chooses image layout + wear strategy) ---
+boot_media = "sd"                 # "sd" | "usb-ssd" | "nvme"
+
+# --- identity ---
+hostname = "markos-lab"
+timezone = "UTC"                  # e.g. "Europe/Berlin"
+
+# --- web UI admin (created on first boot; stored argon2id-hashed) ---
+admin_user = "admin"
+admin_password = "change-me-please"
+
+# --- network ---
+[network]
+dhcp = true
+mdns_name = "pi-inference"        # → http://pi-inference.local
+# For static:
+# dhcp = false
+# ip = "192.168.1.50"
+# gateway = "192.168.1.1"
+# dns = "1.1.1.1"
+# WiFi (omit both for Ethernet-only; WPA2/WPA3-SAE):
+# wifi_ssid = "home"
+# wifi_psk = "a-long-passphrase"
+
+# --- SSH & recovery ---
+[ssh]
+enabled = true                    # key-only; password logins are never enabled
+authorized_keys = [
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... mark@laptop",
+]
+serial_console = true             # UART recovery console (recommended)
+
+# --- updates (manual checks only; nothing phones home) ---
+update_channel = "stable"         # "stable" | "manual"
+# update_manifest_url = "https://example.com/markos/manifest.json"
+
+# --- optional: model preseed so the box is usable immediately ---
+[model_preseed]
+repo = "bartowski/Qwen3-0.6B-GGUF"
+quant = "Q4_K_M"                  # Q4_K_M | Q5_K_M | Q6_K | Q8_0 | …
+# or a direct file URL instead of repo+quant:
+# url = "https://example.com/model.Q4_K_M.gguf"
+
+# --- hardware acknowledgements ---
+active_cooling = true             # false → installer warns about throttling

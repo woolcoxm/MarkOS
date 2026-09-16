@@ -1,0 +1,10 @@
+#!/bin/sh
+# runsv: dropbear SSH — key-only, enabled by the installer. The service is
+# controlled via /data/state/ssh-enabled (written by the provision file).
+# 'sv down dropbear' (or removing the flag + reboot) disables it.
+exec 2>&1
+while [ ! -f /data/state/ssh-enabled ]; do
+	sleep 10
+done
+# -s: no password logins ever. -w: no root passwords (n/a, belt+braces).
+exec /usr/sbin/dropbear -F -E -s -w -p 22

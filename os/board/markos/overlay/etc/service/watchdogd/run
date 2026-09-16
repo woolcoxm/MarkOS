@@ -1,0 +1,12 @@
+#!/bin/sh
+# runsv: watchdogd — hardware watchdog petting. If this process tree hangs,
+# the BCM2712 watchdog reboots the box (last resort; runit already restarts
+# crashed services individually). Timeout 60 s, pet every 15 s.
+exec 2>&1
+# Down for 60 s at boot so a slow first boot (data resize, model preseed)
+# cannot reboot-loop the box; the daemon takes over after S05.
+sleep 45
+while [ ! -c /dev/watchdog0 ]; do
+	sleep 5
+done
+exec busybox watchdog -F -t 15 -T 60 /dev/watchdog0

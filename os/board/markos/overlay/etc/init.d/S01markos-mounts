@@ -1,0 +1,65 @@
+#!/bin/sh
+# S01markos-mounts — data partition, bind mounts, writable-/etc strategy.
+#
+# SD variant: root is squashfs (RO). /etc gets a tmpfs overlay seeded from
+# the RO copy so dropbear keys / runtime tweaks work; persistent system
+# config lives in /data/state. SSD/NVMe: root is ext4 rw, /etc stays real.
+case ":$0:" in *rcS*) ;; esac
+
+DATA_PART=""
+for cand in /dev/mmcblk0p4 /dev/nvme0n1p4 /dev/sda4 /dev/vda4; do
+	if [ -b "$cand" ]; then DATA_PART="$cand"; break; fi
+done
+
+mount_data() {
+	if [ -n "$DATA_PART" ]; then
+		mkdir -p /data
+		fsck.ext4 -p "$DATA_PART" >/dev/null 2>&1 || true
+		mount -t ext4 -o noatime "$DATA_PART" /data || {
+			# Corrupt data fs: mkfs once rather than loop-brick.
+			mkfs.ext4 -F -L data "$DATA_PART" >/dev/null 2>&1
+			mount -t ext4 -o noatime "$DATA_PART" /data
+		}
+	fi
+	mkdir -p /data/state /data/models /data/log
+	mount --bind /data/state /var/lib/markos 2>/dev/null
+	mount --bind /data/log /var/log/markos 2>/dev/null
+}
+
+# Boot partition: mount by device (LABEL= needs udev/blkid we don't ship).
+mount_boot() {
+	local p1=""
+	case "$DATA_PART" in
+		/dev/mmcblk0p4) p1=/dev/mmcblk0p1 ;;
+		/dev/nvme0n1p4) p1=/dev/nvme0n1p1 ;;
+		/dev/sda4)      p1=/dev/sda1 ;;
+		/dev/vda4)      p1=/dev/vda1 ;;
+	esac
+	if [ -n "$p1" ] && [ -b "$p1" ]; then
+		mount -t vfat -o ro "$p1" /boot 2>/dev/null || true
+	fi
+}
+
+writable_root() {
+	grep -E ' / (ext4|btrfs) ' /proc/mounts | grep -q rw
+}
+
+mount_data
+mount_boot
+
+if ! writable_root; then
+	# Squashfs root: give /etc a writable tmpfs copy (bind-mounted over the
+	# RO original). The staging dir lives under /run (tmpfs, mounted by
+	# `mount -a` before rcS) — the RO root can't host it.
+	mkdir -p /run/etc-overlay
+	mount -t tmpfs -o mode=0755,size=16m tmpfs /run/etc-overlay
+	cp -a /etc/. /run/etc-overlay/ 2>/dev/null
+	mount -o bind /run/etc-overlay /etc
+fi
+
+# Thermal comfort: THP madvise keeps latency predictable during decode.
+if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
+	echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+fi
+
+exit 0

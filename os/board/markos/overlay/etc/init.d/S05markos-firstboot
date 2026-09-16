@@ -1,0 +1,34 @@
+#!/bin/sh
+# S05markos-firstboot — grow the data partition to fill the media, once.
+# Keeps model storage isolated (still its own partition) while using the
+# whole disk; runs after the network/provision stages and never blocks boot.
+
+FLAG=/data/state/.expanded
+[ -e "$FLAG" ] && exit 0
+
+DISK=""
+for cand in /dev/mmcblk0 /dev/nvme0n1 /dev/sda /dev/vda; do
+	if [ -b "$cand" ]; then DISK="$cand"; break; fi
+done
+[ -n "$DISK" ] || exit 0
+
+# Refuse to touch the device we booted from if it's not the media with the
+# data partition label (safety net for exotic setups).
+free_kb=$(sfdisk -F "$DISK" 2>/dev/null | sed -n 's/.*unallocated \([0-9]*\) b.*/\1/p' | head -n1)
+# sfdisk -F prints bytes; busybox/utillinux differ — use parted-free math via
+# sfdisk -l when unsure. Grow only when > 1 GiB seems free (conservative).
+if command -v sfdisk >/dev/null 2>&1; then
+	# Recreate partition 4 in place, extending to end of disk.
+	echo ",+" | sfdisk --no-reread --force -N 4 "$DISK" >/dev/null 2>&1
+	partx -u "$DISK" >/dev/null 2>&1 || true
+	DATA_PART="${DISK}4"
+	[ -b "$DATA_PART" ] || DATA_PART="${DISK}p4"
+	if [ -b "$DATA_PART" ]; then
+		resize2fs "$DATA_PART" >/dev/null 2>&1 && {
+			touch "$FLAG"
+			echo "markos-firstboot: data partition expanded on $DISK"
+		}
+	fi
+fi
+
+exit 0

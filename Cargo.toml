@@ -1,7 +1,18 @@
 [workspace]
 resolver = "2"
-members = ["kernel"]
+members = ["engine", "installer"]
+# The OS build (os/build.sh) rsyncs engine/ into os/build-sd/build/... —
+# excluded so that copy builds standalone against Buildroot's toolchain
+# instead of inheriting this dev workspace.
+exclude = ["os"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
 
 [profile.release]
-lto = true
+opt-level = 3
+lto = "thin"
 codegen-units = 1
+strip = true

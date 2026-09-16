@@ -1,0 +1,98 @@
+#!/bin/sh
+# S03markos-net — hostname, provisioning leftovers, WiFi, DHCP, IPv4LL rescue.
+#
+# Persistent network config lives in /data/state (written by the installer's
+# provision file, editable via the web UI):
+#   net.conf:   MODE=dhcp | MODE=static IP=... GW=... DNS1=... DNS2=... IFACE=eth0|wlan0
+#   wpa_supplicant.conf  (if WiFi; supports WPA2/WPA3-SAE via wpa_supplicant)
+
+# 1. hostname
+if [ -f /data/state/hostname ]; then
+	hostname -F /data/state/hostname
+	cp /data/state/hostname /etc/hostname
+fi
+
+# 2. timezone + locale (from the installer's provision file)
+if [ -s /data/state/tz ]; then
+	cp /data/state/tz /etc/TZ
+fi
+if [ -s /data/state/lang ]; then
+	echo "export LANG=$(cat /data/state/lang)" > /etc/profile.d/00-lang.sh
+	echo "export LC_ALL=$(cat /data/state/lang)" >> /etc/profile.d/00-lang.sh
+	chmod 644 /etc/profile.d/00-lang.sh
+fi
+
+# 3. dropbear host keys survive in /data/state/etc-seed? Keys live in /etc
+#    (tmpfs on SD). Persist once, restore every boot.
+if [ ! -d /data/state/dropbear ]; then
+	mkdir -p /data/state/dropbear
+fi
+if [ -n "$(ls /data/state/dropbear 2>/dev/null)" ]; then
+	mkdir -p /etc/dropbear
+	cp -a /data/state/dropbear/. /etc/dropbear/
+fi
+if [ -x /usr/bin/dropbearkey ] && [ ! -f /etc/dropbear/dropbear_rsa_host_key ]; then
+	mkdir -p /etc/dropbear
+	/usr/bin/dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key >/dev/null 2>&1 || true
+fi
+if [ -d /etc/dropbear ]; then
+	cp -a /etc/dropbear/. /data/state/dropbear/ 2>/dev/null || true
+fi
+# authorized_keys are provisioned by the installer into /boot/markos/ and
+# copied to root's home on first boot.
+if [ -f /boot/markos/authorized_keys ]; then
+	mkdir -p /root/.ssh
+	cp /boot/markos/authorized_keys /root/.ssh/authorized_keys
+	chmod 600 /root/.ssh/authorized_keys
+fi
+
+# Keep the provision snapshot on the boot partition: the factory-reset path
+# (GPIO button / web UI trigger) restores /data/state from it.
+if [ -f /boot/markos/provision.env ]; then
+	mount -o remount,rw /boot 2>/dev/null || true
+	mkdir -p /boot/markos-snapshot
+	cp /boot/markos/provision.env /boot/markos-snapshot/provision.env
+	sync
+	mount -o remount,ro /boot 2>/dev/null || true
+fi
+
+# 4. loopback + WiFi (if configured) + DHCP + always-on IPv4LL rescue address
+ip link set lo up 2>/dev/null
+
+IFACE="eth0"
+MODE="dhcp"
+[ -f /data/state/net.conf ] && . /data/state/net.conf
+
+if [ -f /data/state/wpa_supplicant.conf ] && [ -e /sys/class/net/wlan0 ]; then
+	ip link set wlan0 up
+	wpa_supplicant -B -i wlan0 -c /data/state/wpa_supplicant.conf -D nl80211 2>/dev/null
+	IFACE="wlan0"
+fi
+[ -n "$IFACE_SET" ] && IFACE="$IFACE_SET"
+ip link set "$IFACE" up 2>/dev/null
+
+case "$MODE" in
+	static)
+		ip addr flush dev "$IFACE" 2>/dev/null
+		ip addr add "${IP:-192.168.1.50}/24" dev "$IFACE"
+		[ -n "$GW" ] && ip route add default via "$GW" dev "$IFACE"
+		echo "nameserver ${DNS1:-1.1.1.1}" > /etc/resolv.conf
+		[ -n "$DNS2" ] && echo "nameserver $DNS2" >> /etc/resolv.conf
+		;;
+	*)
+		udhcpc -b -i "$IFACE" -p /var/run/udhcpc.pid -x hostname:"$(hostname)" >/dev/null 2>&1 &
+		;;
+esac
+
+# IPv4LL rescue address: a direct laptop cable always reaches the UI at
+# http://169.254.9.1:4444 even with broken LAN config (recovery path #1).
+ip addr add 169.254.9.1/16 dev "$IFACE" 2>/dev/null
+
+# 5. mDNS name advertisement happens via avahi (runsv service); reflect the
+#    configured mdns name from the engine store if present.
+MDNS="$(sed -n 's/.*"mdns_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /var/lib/markos/markos.json 2>/dev/null | head -n1)"
+if [ -n "$MDNS" ] && [ -f /etc/avahi/avahi-daemon.conf ]; then
+	sed -i "s/^host-name=.*/host-name=$MDNS/" /etc/avahi/avahi-daemon.conf
+fi
+
+exit 0

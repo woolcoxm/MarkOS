@@ -1,122 +1,104 @@
-# MarkOS
+# MarkOS — a single-purpose LLM inference appliance
 
-A **bare-metal Raspberry Pi appliance for local LLM inference**. No Linux, no
-distro, no shell: flash the SD card, power on, and the Pi boots straight into
-a minimal inference engine that serves a GGUF model over the network. The
-configuration is frozen at install time (the installer bakes it into the
-image); at runtime the system is controlled only through its own
-authenticated control protocol.
-
-Design rule for every decision: *does this make the model run faster or the
-appliance simpler?* If not, it does not exist.
-
-## Why this is different
-
-- **Boots to inference in seconds** — no bootloader chain, no init system.
-- **Zero OS overhead** — no scheduler jitter, no syscalls, no page-cache
-  surprises; every core does tensor math or nothing.
-- **Hard real-time memory policy** — no swap ever; the model either fits or
-  the installer refuses to build the image.
-- **Remote-first**: TCP control protocol (token-authenticated) for status,
-  model load, and inference; install-time config is the only other surface.
-- **Optional accelerator**: M5Stack LLM8850 (Axera AX8850, 24 TOPS, 8 GB)
-  on the Pi 5's M.2 slot — research + implementation plan in
-  [docs/llm8850-research.md](docs/llm8850-research.md) /
-  [docs/axera-markos-plan.md](docs/axera-markos-plan.md), building on
-  [woolcoxm/Axera-AX8850-GGUF-Support](https://github.com/woolcoxm/Axera-AX8850-GGUF-Support).
-
-## Target hardware
-
-| Board | Status |
-|-------|--------|
-| QEMU virt (qemu-system-aarch64) | dev/CI loop — all acceptance gates run here |
-| Raspberry Pi 5 (BCM2712) | deployment target — A76 + UDOT, M.2 for LLM8850 (`make image-pi5` builds `kernel_2712.img`) |
-
-## What's in the kernel (AArch64, no_std)
-
-| Subsystem | Where | Notes |
-|---|---|---|
-| Boot / EL normalization / SMP | `main.rs`, `smp.rs`, `psci.rs` | PSCI (virt), spin-table + mailbox (Pi hw) |
-| MMU + exception vectors | `mmu.rs`, `vectors.rs` | identity map + ECAM/PCIe windows |
-| virtio-blk + read-only FAT32 | `virtio_blk.rs`, `fat.rs` | SD image reads in QEMU; SDHCI on hw is a later phase |
-| GGUF v3 parser | `gguf.rs` | tensor table, bounds-checked |
-| Execution pool (thread-per-core) | `pool.rs` | no scheduler; cores spin between jobs |
-| NEON UDOT int8 matmul | `matmul.rs` | per-function `dotprod` target feature, runtime-checked |
-| virtio-net + ARP/IPv4/ICMP + TCP | `net.rs`, `tcp.rs` | one listener, control protocol on top |
-| Control protocol | `control.rs` | HELLO/STATUS/LOAD/RUN/PING/ECHO, token auth |
-| Install-time config | `config.rs` | MARKOS.CFG (ip/port/token) read once at boot |
-| PCIe ECAM enumeration | `pcie.rs` | the LLM8850 on-ramp (Pi-7a) |
-
-## Acceptance gates
-
-Every phase lands with a gate that greps its own serial log / client
-verdict. `scripts/regress.sh` runs the full sweep:
+MarkOS turns a **Raspberry Pi 5 (16 GB)** into a headless, maintenance-free
+LLM inference box: boot it, find it at `http://pi-inference.local`, and hit
+an OpenAI-compatible API from anything on your LAN. No desktop, no unrelated
+services, no cloud dependency — every component is custom-built for this one
+job.
 
 ```
-bash scripts/regress.sh            # all 11 gates
-make test-pcie                     # or any single gate
+┌────────────────────────────────────────────────────────────────────┐
+│  install.toml / GUI  →  markos-installer (Windows/Linux, Rust)     │
+│        │  validates, injects provision file into image             │
+│        ▼                                                           │
+│  markos-sd.img / markos-ssd.img  ←  os/build.sh (Buildroot)        │
+│        flashed to SD / USB SSD / NVMe                              │
+│        ▼                                                           │
+│  Pi 5 boots → runit supervises markos-engine                       │
+│        ├── OpenAI-compatible API  :8080  (SSE streaming)           │
+│        ├── Web configuration UI   :80    (embedded, airgap-safe)   │
+│        ├── rescue UI              169.254.9.1:4444                 │
+│        └── guardrails, A/B updates, watchdog, factory reset        │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
-| Gate | Proves |
+## Language
+
+**Rust, everywhere** — the engine, the installer, the OS userspace. Zero-cost
+abstractions compile to the same machine code as C on the NEON hot path
+(the tensor kernels are ggml's, codegen'd for the Cortex-A76), with no GC, no
+runtime, and single executables: the Windows installer is one `.exe`, the
+engine is one aarch64 binary. Full rationale: [docs/design.md](docs/design.md#2-implementation-language-and-why-it-satisfies-blazing-speeds).
+
+## Repository layout
+
+| path | what it is |
 |---|---|
-| test-exceptions | brk caught+resumed, data abort caught |
-| test-smp | 4 cores online via PSCI, exact shared counter |
-| test-block | virtio-blk bring-up + LBA0 read |
-| test-fat | FAT32 mount + MODEL.BIN read + pattern check |
-| test-pool | parallel sum across all cores |
-| test-matmul | UDOT matmul, 256/256 exact vs scalar |
-| test-net | MARKOS-PING → MARKOS-PONG over TCP (slirp hostfwd) |
-| test-control | HELLO/STATUS/LOAD/RUN — RUN computes matmul on all cores remotely |
-| test-install | installer-baked MARKOS.CFG drives port + token; wrong token rejected |
-| test-soak | 40 rounds RUN+ECHO on one connection (RX-ring wraparound killer) |
-| test-pcie | bare-metal ECAM enumeration (host bridge, NIC, root port) |
-| test-model | real 640 MB Qwen3-0.6B q8_0: 310-tensor table + payload CRCs byte-match the host reference |
-| test-forward | layer-0 forward (BPE, embedding, q8_0 matmuls, RoPE, GQA attention, SwiGLU) matches the numpy reference |
-| test-gen | full 28-layer prefill + greedy decode matches the reference token-for-token |
-| test-gen-net | GEN opcode over TCP: prompt in, streamed TOK lines + GEN_END out, ids/text vs reference |
-| test-model | real 640 MB Qwen3-0.6B q8_0 loaded: full 310-tensor table + payload CRCs byte-match the host reference (`scripts/gguf_ref.py`) |
+| `docs/design.md` | **the design document** — OS base choice, storage strategy per media, A/B updates, recovery, custom-vs-reused boundary |
+| `engine/` | markos-engine: custom HTTP/1.1 serving layer, OpenAI-compatible API (SSE), admin control plane, embedded web UI (`engine/web/`), GGUF reader, memory guardrails, model manager (mock backend default; `llama` feature = llama.cpp/ggml) |
+| `installer/` | markos-installer: egui GUI + scriptable CLI, config validation, **custom FAT32 writer** for config injection, raw-disk flasher (`\\.\PhysicalDriveN`, `/dev/sdX`) |
+| `os/` | Buildroot external tree: defconfig, kernel fragment, board overlay (runit services, firewall, watchdog, first-boot provisioner, recovery, `markos-update`), genimage layouts, `build.sh` |
+| `scripts/make_gguf_test.py` | synthetic GGUF generator (ported from the repo's earlier bare-metal kernel work) |
 
-## Building and running (from Windows, via WSL)
+## Quickstart
 
-```
-wsl bash -lc 'cd /mnt/c/Users/Mark/Desktop/Projects/MarkOS && make run-log'
+**1. Build the appliance image** (Linux/WSL2, ~1 hr first run):
+
+```sh
+cd os && ./build.sh --variant sd     # → os/output/markos-sd.img + .sha256
 ```
 
-Requires: rustup nightly + `aarch64-unknown-none`, `llvm-objcopy`,
-`qemu-system-aarch64`, `sfdisk`/`mkfs.vfat`/`mtools` (test images),
-`python3` (host-side clients/installer). For real Pi 5 hardware:
-`make image-pi5` produces `kernel_2712.img` (cortex-a76 codegen); copy it
-onto the installer-built SD image with the stock Pi firmware blobs.
+**2. Configure + flash** (Windows or Linux; GUI = run `markos-installer` with
+no args, or use the CLI):
 
-## Roadmap
+```sh
+cargo build --release -p markos-installer
+markos-installer --config install.toml.example --image os/output/markos-sd.img \
+                 --target sd --out configured.img
+# then: markos-installer --config install.toml.example --image configured.img \
+#                        --write \\.\PhysicalDrive3 --verify
+```
 
-- [x] Pi-0 — AArch64 bring-up: boots in QEMU, `kernel alive` on PL011
-- [x] Pi-1 — MMU page tables, exception vectors (VBAR), generic timer
-- [x] Pi-2 — SMP: all cores online (PSCI on virt; spin-table+mailbox on Pi hw)
-- [x] Pi-3 — block storage: virtio-blk + read-only FAT32 + GGUF v3 parse
-- [x] Pi-4 — execution pool + NEON UDOT int8 matmul (256/256 exact)
-- [x] Pi-5 — virtio-net + ARP/IPv4/ICMP + minimal TCP
-- [x] Pi-5b — control protocol: HELLO/STATUS/LOAD/RUN over TCP, token auth
-- [x] Pi-6 — installer: MARKOS.CFG (ip/port/token) baked into SD, enforced at boot
-- [x] Phase 8 — compute kernels: BPE tokenizer, q8_0 streaming matvec,
-      full 28-layer decode — numpy-verified (test-forward / test-gen)
-- [x] Phase 9 — GEN opcode: prompt in, streamed tokens out over TCP
-      (test-gen-net)
-- [x] Pi-7a — LLM8850 research + bare-metal PCIe ECAM enumeration
-- [ ] Pi-7b — AX8850 transport RE → bare-metal axcl-lite → NPU decode
-      ([plan](docs/axera-markos-plan.md))
-- [x] Phase 10/11 — tokens/sec + per-token latency in STATS; sustained
-      generation soak with drift bound (test-gensoak); throughput
-      measurement notes in docs/phase10-notes.md
-- [ ] Pi-8 — hardware soak + llama.cpp throughput comparison on the Pi 5;
-      SDHCI for real SD reads; real-hardware validation on Pi 5 16GB
+**3. Use it**: boot the Pi (27 W USB-C PD, active cooler recommended), open
+`http://pi-inference.local`, add a model (HF repo + quant), hit the API:
 
-An earlier x86_64 exploration (Limine unikernel, phases 0–3) is preserved on
-the `x86_64-archive` branch for reference; the Pi is now the only target.
+```sh
+curl http://pi-inference.local:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3-0-6b","messages":[{"role":"user","content":"hello"}],"profile":"coding"}'
+```
 
-## Scope notes (hard boundaries)
+## Design invariants
 
-No multi-tenancy, no general scheduler, no POSIX, no shell, no runtime
-configuration outside the control protocol. NPU acceleration (LLM8850)
-follows the research-gated track above — the NPU compiler (Pulsar2) stays
-an offline x86 toolchain; the card is driven by engines, never compiled to.
+- **CPU/NEON only.** The VideoCore VII GPU is not a compute target; no GPU
+  code path exists anywhere.
+- **Guardrails, not crashes.** The engine estimates weights + KV + compute
+  buffers from GGUF metadata and refuses loads that would OOM — with numbers,
+  in the UI and via HTTP 409.
+- **Concurrency honesty.** One active generation per resident model, bounded
+  queue, `429` on overflow. Up to 2 models resident when memory allows
+  (LRU eviction otherwise).
+- **Rollback-safe updates.** A/B slots + firmware `tryboot`; commit only
+  after the engine proves healthy for 3 minutes. Manual on-demand only.
+- **Always a way back in.** Link-local rescue UI (`169.254.9.1:4444`),
+  GPIO26 factory-reset button, serial console — see
+  [docs/recovery.md](docs/recovery.md).
+
+## Validation status
+
+| component | validated |
+|---|---|
+| engine API/auth/guardrails/queue/templates | 22 host unit tests, green |
+| engine end-to-end (boots real binary, provision → login → OpenAI JSON → SSE) | integration test, green |
+| **real tensor backend (`--features llama`)** | **compiles against llama.cpp (WSL, cmake+bindgen); real Qwen2.5-0.5B Q4_K_M served: correct answer, `finish_reason: stop`, 28-chunk SSE stream** |
+| **OS image build (`os/build.sh --variant sd`, WSL2 Ubuntu)** | **`markos-sd.img` produced: FAT32 boot (kernel/dtb/firmware), squashfs A/B slots, data partition, aarch64 engine cross-compiled with llama.cpp+TLS, full appliance overlay (init stages, s6 services, firewall, update/recovery tools) — verified by unpacking the image** |
+| installer config validation, FAT32 injection round-trip | unit + e2e green; **injection verified against the real Buildroot image (provision files read back via FAT32 walk)** |
+| installer → engine provision handoff (cross-component) | manual e2e, green |
+| **appliance boot gate (QEMU aarch64)** | **`markos-sd.img` booted headless on `qemu-system-aarch64 -M virt` (virtio kernel fragment): s6-supervised engine healthy in ~35 s, installer-provisioned admin login (`{"ok":true,"role":"Admin"}`, wrong password 401), hardcoded Qwen2.5-0.5B Q4_K_M auto-loaded and served — `"The capital of France is Paris."`, `finish_reason: stop`** — procedure in [docs/build.md](docs/build.md) |
+| **USB SSD / NVMe variant (`--variant ssd`)** | **`markos-ssd.img` built (ext4 root + A/B slots + data partition); engine, init stages, s6 services and inittab verified inside the ext4 root by loop-mount** |
+| on-target behavior (real Pi 5: thermal, NVMe EEPROM boot order) | requires physical hardware |
+
+## Non-goals (v1)
+
+No GPU/accelerator path · no multi-Pi clustering (noted as future work in the
+design doc) · no general server dashboard · no telemetry, no auto-updates,
+no runtime dependencies beyond user-initiated model downloads.

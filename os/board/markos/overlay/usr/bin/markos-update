@@ -1,0 +1,46 @@
+#!/bin/sh
+# markos-update — A/B image update (design doc §5).
+#
+# usage: markos-update <new-rootfs-image> <sha256-file>
+#
+# Writes the new rootfs into the INACTIVE slot, arms firmware tryboot for a
+# single boot into it, and reboots. boot-confirm (runsv) commits only after
+# the engine proves healthy for 3 minutes; otherwise the next boot returns to
+# the current slot untouched. Manual/on-demand only — nothing auto-installs.
+
+[ $# -eq 2 ] || { echo "usage: $0 <rootfs-image> <sha256-file>" >&2; exit 2; }
+IMG="$1"; SUM="$2"
+
+[ -f "$IMG" ] || { echo "image missing: $IMG" >&2; exit 1; }
+[ -f "$SUM" ] || { echo "checksum file missing: $SUM" >&2; exit 1; }
+
+echo "verifying checksum..."
+(cd "$(dirname "$IMG")" && sha256sum -c "$(basename "$SUM")") || {
+	echo "checksum MISMATCH; refusing update" >&2
+	exit 1
+}
+
+# Which root are we on?
+CUR_PART="$(sed -n 's/.*root=PARTUUID=[0-9a-f]*-\([0-9a-f]*\).*/\1/p' /proc/cmdline)"
+case "$CUR_PART" in
+	02) INACTIVE=03; INACTIVE_DEV="$(ls /dev/mmcblk0p3 /dev/nvme0n1p3 /dev/sda3 /dev/vda3 2>/dev/null | head -n1)" ;;
+	03) INACTIVE=02; INACTIVE_DEV="$(ls /dev/mmcblk0p2 /dev/nvme0n1p2 /dev/sda2 /dev/vda2 2>/dev/null | head -n1)" ;;
+	*) echo "cannot determine active slot from cmdline" >&2; exit 1 ;;
+esac
+[ -b "$INACTIVE_DEV" ] || { echo "inactive slot device not found" >&2; exit 1; }
+
+echo "writing $IMG to inactive slot p$INACTIVE ($INACTIVE_DEV)..."
+dd if="$IMG" of="$INACTIVE_DEV" bs=4M conv=fsync status=none || {
+	echo "write failed" >&2; exit 1
+}
+sync
+
+# Arm tryboot: firmware boots this cmdline for exactly one boot.
+NEW_CMDLINE="$(sed "s/PARTUUID=[0-9a-f]*-0[23]/PARTUUID=6d61726b-$INACTIVE/" /boot/cmdline.txt)"
+mount -o remount,rw /boot || { echo "cannot remount /boot rw" >&2; exit 1; }
+printf '%s\n' "$NEW_CMDLINE" > /boot/tryboot-cmdline.txt
+sync
+mount -o remount,ro /boot
+
+echo "rebooting into slot p$INACTIVE (tryboot). boot-confirm will commit if healthy."
+exec /usr/bin/markos-engine --reboot-tryboot

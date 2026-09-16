@@ -1,0 +1,5 @@
+#!/bin/sh
+# runsv: avahi-daemon — mDNS advertisement (markos.local / configured name).
+exec 2>&1
+mkdir -p /var/run/avahi-daemon
+exec avahi-daemon

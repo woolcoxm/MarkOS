@@ -1,1 +1,27 @@
-* text=auto eol=lf
+# Auto-normalize text; commit LF.
+* text=auto
+
+# Scripts that execute on the appliance/Linux builders must never get CRLF
+# (a Windows checkout with autocrlf would corrupt the OS overlay).
+*.sh       text eol=lf
+*.py       text eol=lf
+build.sh   text eol=lf
+*.mk       text eol=lf
+*.fragment text eol=lf
+*.cfg      text eol=lf
+Config.in  text eol=lf
+external.* text eol=lf
+inittab    text eol=lf
+fstab      text eol=lf
+run        text eol=lf
+post-build.sh  text eol=lf
+post-image.sh  text eol=lf
+nftables.conf  text eol=lf
+cmdline.txt    text eol=lf
+config_5.txt   text eol=lf
+
+# Windows-only sources stay CRLF-tolerant; binaries never touched
+*.png binary
+*.jpg binary
+*.gguf binary
+*.img binary

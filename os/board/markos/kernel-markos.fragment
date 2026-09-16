@@ -1,0 +1,40 @@
+# MarkOS kernel fragment on top of bcm2712_defconfig.
+# Everything needed to boot the appliance layout; nothing speculative.
+CONFIG_OVERLAY_FS=y
+CONFIG_SQUASHFS=y
+CONFIG_SQUASHFS_XZ=y
+CONFIG_EXT4_FS=y
+CONFIG_EXT4_FS_POSIX_ACL=y
+CONFIG_VFAT_FS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
+CONFIG_TMPFS=y
+CONFIG_TMPFS_POSIX_ACL=y
+
+# firewall
+CONFIG_NETFILTER=y
+CONFIG_NF_TABLES=y
+CONFIG_NF_TABLES_INET=y
+CONFIG_NFT_CT=y
+CONFIG_NFT_NAT=y
+CONFIG_NFT_COMPAT=y
+
+# watchdog (last-resort reboot if supervision itself hangs)
+CONFIG_WATCHDOG=y
+CONFIG_BCM2835_WDT=y
+
+# thermal visibility for the web UI
+CONFIG_THERMAL=y
+
+# GPIO (factory-reset button via sysfs)
+CONFIG_GPIO_SYSFS=y
+
+# KV-cache friendly: hugepages left off by default; transparent hugepages
+# are set by userspace (S01markos-mounts) to madvise.
+
+# Emulated validation (docs/build.md): boot the image under QEMU's `virt`
+# machine. virtio-mmio is the transport `virt` exposes; none of this
+# hardware exists on a real Pi, so enabling it costs nothing on target.
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y

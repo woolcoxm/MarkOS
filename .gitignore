@@ -1,11 +1,10 @@
-# Build outputs
+/target
+/engine/web/.DS_Store
 *.img
 *.log
-
-# Rust
-/target/
-
-# QEMU filter-dump captures
-*.pcap
-__pycache__/
-*.pyc
+/data
+/build
+/os/buildroot
+/os/dl
+/os/output
+Cargo.lock.bak

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MarkOS — Inference Control</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="/favicon.svg">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg width="22" height="22" viewBox="0 0 24 24"><rect x="2" y="2" width="20" height="20" rx="4" fill="#e8542f"/><path d="M7 16V8l5 5 5-5v8" stroke="#fff" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span>MarkOS</span><span class="tag">inference control</span>
+  </div>
+  <div id="hdr-status" class="hdr-status" title="system health">–</div>
+  <div id="hdr-user" class="hdr-user"></div>
+</header>
+
+<div id="login-overlay" class="overlay hidden">
+  <form id="login-form" class="card login-card">
+    <h2>Sign in</h2>
+    <p class="muted">The admin account is created by the installer or first-boot provisioning — there are no default credentials.</p>
+    <label>Username <input name="username" autocomplete="username" required></label>
+    <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+    <div class="row"><button class="btn primary" type="submit">Sign in</button><span id="login-err" class="err"></span></div>
+  </form>
+</div>
+
+<nav id="nav" class="hidden">
+  <a href="#models">Models</a>
+  <a href="#monitor">Monitor</a>
+  <a href="#network">Network</a>
+  <a href="#users">Users</a>
+  <a href="#system">System</a>
+</nav>
+
+<main id="view" class="hidden"></main>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

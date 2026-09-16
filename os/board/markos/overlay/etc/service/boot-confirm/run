@@ -1,0 +1,31 @@
+#!/bin/sh
+# runsv: boot-confirm — commit an A/B update after it proves healthy.
+#
+# Firmware `tryboot` boots tryboot-cmdline.txt for exactly one boot. If the
+# new root is healthy (engine ready) for 3 consecutive minutes, we commit by
+# replacing cmdline.txt. If the box dies or watchdogs first, the next normal
+# boot simply uses the old slot again — an update can never brick the box.
+exec 2>&1
+
+if [ ! -f /boot/tryboot-cmdline.txt ]; then
+	# No pending update; idle (kept supervised so it picks up future tries).
+	exec sleep 2147483647
+fi
+
+echo "boot-confirm: pending A/B update detected; proving health"
+
+i=0
+while [ $i -lt 18 ]; do
+	if curl -fsS --max-time 5 http://127.0.0.1:8080/readyz >/dev/null 2>&1; then
+		i=$((i + 1))
+	else
+		i=0
+	fi
+	sleep 10
+done
+
+mount -o remount,rw /boot
+cp /boot/tryboot-cmdline.txt /boot/cmdline.txt
+sync
+mount -o remount,ro /boot
+echo "boot-confirm: update committed to slot $(sed -n 's/.*root=PARTUUID=[0-9a-f]*-\([0-9a-f]*\).*/\1/p' /boot/cmdline.txt)"

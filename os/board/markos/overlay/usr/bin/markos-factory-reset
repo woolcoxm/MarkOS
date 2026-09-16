@@ -1,0 +1,9 @@
+#!/bin/sh
+# markos-factory-reset — manual trigger for the recovery path (also invoked
+# by S02markos-recovery for the GPIO button). Restores /data/state from the
+# provision snapshot, reverts pending A/B tries, reboots. Models survive.
+
+echo "factory reset requested via CLI"
+touch /data/state/recovery-requested
+sync
+reboot -f

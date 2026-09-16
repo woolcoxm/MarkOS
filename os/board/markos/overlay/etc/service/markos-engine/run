@@ -1,0 +1,5 @@
+#!/bin/sh
+# runsv: markos-engine (inference API + web UI in one supervised process).
+exec 2>&1
+cd /var/lib/markos || exit 1
+exec /usr/bin/markos-engine --data-dir /var/lib/markos

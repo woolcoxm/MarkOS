@@ -1,0 +1,24 @@
+menuconfig BR2_PACKAGE_MARKOS_ENGINE
+	bool "markos-engine"
+	depends on BR2_PACKAGE_HOST_RUSTC_TARGET_ARCH_SUPPORTS
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	help
+	  MarkOS inference engine: custom serving layer (HTTP/1.1, OpenAI-
+	  compatible API, SSE streaming, admin control plane, embedded web UI,
+	  memory guardrails, model manager). The `llama` cargo feature compiles
+	  the llama.cpp/ggml tensor backend via cmake with Buildroot's
+	  Cortex-A76 cross toolchain (CPU/NEON only — no GPU code path exists).
+
+	  Host build requirements (enforced by os/build.sh): rustup with the
+	  aarch64-unknown-linux-gnu target and host cmake.
+
+if BR2_PACKAGE_MARKOS_ENGINE
+
+config BR2_PACKAGE_MARKOS_ENGINE_TLS
+	bool "enable TLS (rustls) for web UI/API"
+	default y
+	help
+	  Self-signed certificate is generated on first boot; operators can
+	  replace cert/key via /data/state/tls.
+
+endif

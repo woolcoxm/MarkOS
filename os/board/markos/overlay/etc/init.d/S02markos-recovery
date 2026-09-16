@@ -1,0 +1,57 @@
+#!/bin/sh
+# S02markos-recovery — factory-reset paths (docs/design.md §6, docs/recovery.md).
+#
+# 1. GPIO26 button held >=3 s during boot (idle pin, active-low to GND).
+# 2. File trigger: /data/state/recovery-requested (settable over the web UI
+#    even when the network config itself is broken, via the link-local UI).
+# Restores /data/state to the provision snapshot and reverts any pending A/B
+# try, then reboots. Models on /data/models are preserved.
+
+do_reset() {
+	echo "markos-recovery: factory reset requested"
+	# Revert pending A/B try before it can boot.
+	if [ -e /boot/tryboot-cmdline.txt ]; then
+		mount -o remount,rw /boot 2>/dev/null || true
+		rm -f /boot/tryboot-cmdline.txt
+		mount -o remount,ro /boot 2>/dev/null || true
+	fi
+	# Wipe mutable state; keep models.
+	rm -rf /data/state
+	mkdir -p /data/state
+	# Restore provision snapshot if the boot partition carries one.
+	if [ -d /boot/markos-snapshot ] && [ -n "$(ls /boot/markos-snapshot 2>/dev/null)" ]; then
+		cp -a /boot/markos-snapshot/. /data/state/
+	fi
+	date -u +"%Y-%m-%dT%H:%M:%SZ factory-reset" > /data/state/recovery-last.txt 2>/dev/null || true
+	sync
+	reboot -f
+}
+
+# File trigger (also honored post-boot by the engine UI's recovery status).
+if [ -f /data/state/recovery-requested ]; then
+	rm -f /data/state/recovery-requested
+	do_reset
+fi
+
+# Button: GPIO26 (sysfs), active-low, held 3 s.
+if [ -d /sys/class/gpio ]; then
+	echo 26 > /sys/class/gpio/export 2>/dev/null || true
+	if [ -d /sys/class/gpio/gpio26 ]; then
+		echo in > /sys/class/gpio/gpio26/direction
+		held=0
+		i=0
+		while [ $i -lt 15 ]; do
+			if [ "$(cat /sys/class/gpio/gpio26/value)" = "0" ]; then
+				held=$((held + 1))
+			else
+				held=0
+			fi
+			[ $held -ge 6 ] && do_reset
+			sleep 0.2
+			i=$((i + 1))
+		done
+		echo 26 > /sys/class/gpio/unexport 2>/dev/null || true
+	fi
+fi
+
+exit 0

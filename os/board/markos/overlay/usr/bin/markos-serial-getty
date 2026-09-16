@@ -1,0 +1,6 @@
+#!/bin/sh
+# Serial recovery console on the Pi 5 UART (ttyAMA10 @ 115200). Dormant when
+# the node is absent so busybox init doesn't respawn-loop (docs/recovery.md).
+DEV=/dev/ttyAMA10
+[ -c "$DEV" ] || exec sleep 2147483647
+exec /sbin/getty -L "$DEV" 115200 vt100
