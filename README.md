@@ -255,7 +255,17 @@ build.
 | **USB SSD / NVMe variant (`--variant ssd`)** | **`markos-ssd.img` built (ext4 root + A/B slots + data partition); engine, init stages, s6 services and inittab verified inside the ext4 root by loop-mount** |
 | on-target boot (real Pi 5 16 GB, d0 stepping, 2026 production) | **green on hardware**: Pi OS-derived boot env boots the MarkOS kernel (6.18) + squashfs root; first-boot net.conf adoption (static IP + gratuitous ARP), web UI login + tabs, SSH key auth (root), data partition grown 512 M → 936 G with GDT-reserved fs |
 | on-target behavior (thermal under sustained load, NVMe EEPROM boot order) | requires physical hardware |
-| **Axera AX8850 NPU support** (engine `axcl` feature, ggml-axcl fork with runtime geometry + engine-set manifests; Buildroot driver/runtime packages) | **green on hardware**: appliance boots in 11 s to a serving API; card detected (`AX650N`, PCIe, firmware V3.6.4), all 5 driver modules loaded, engine set found; Qwen2.5-0.5B served through the OpenAI API. NPU-tier generation quality under investigation — see [docs/axera.md](docs/axera.md) and [docs/hardware-debug-2026-09-16.md](docs/hardware-debug-2026-09-16.md) |
+| **Axera AX8850 NPU support** (engine `axcl` feature, ggml-axcl fork with runtime geometry + engine-set manifests; Buildroot driver/runtime packages) | **green on hardware, both tiers measured**: NPU tier (Qwen3-0.6B Q8_0, matching engine set) serves coherent reasoning at **7.4 t/s decode / 10 t/s prefill** with 2.6 GB CMM on card; CPU tier (Qwen2.5-0.5B Q5_0, non-matching) serves at **1.0 t/s decode** with **7/8 quality evals passing**. Same engine process, per-model routing: matching models → NPU (7.4× CPU speedup), any other GGUF → CPU (always coherent). Full bring-up story: [docs/hardware-debug-2026-09-16.md](docs/hardware-debug-2026-09-16.md) |
+
+## Measured performance (on-target, Raspberry Pi 5 16 GB + AX8850)
+
+| model | tier | quant | decode t/s | prefill t/s | quality eval | notes |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | **NPU** (matching engine set) | Q8_0 | **7.4** | **10** | generates coherent reasoning (Qwen3 thinking mode) | 2.6 GB CMM on card; 7.4× CPU speedup |
+| Qwen2.5-0.5B | CPU (non-matching) | Q5_0 | 1.0 | 2 | 7/8 pass (arithmetic, factual, reasoning) | pure CPU/NEON fallback tier |
+
+Benchmark suite: `os/output/bench.py` (decode speed 3-run median, prefill
+on ~60-token prompt, 8-prompt quality eval at temperature 0.1).
 
 ## Non-goals (v1)
 

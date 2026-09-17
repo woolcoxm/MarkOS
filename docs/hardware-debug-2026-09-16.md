@@ -87,13 +87,27 @@ remaining open item is NPU-generation quality (garbage output), not boot.
 | 9 | S40network fights S03 ("RTNETLINK: File exists") | `BR2_SYSTEM_DHCP="eth0"` generates an `/etc/network/interfaces` with a dhcp stanza; `ifup -a` runs after S03 and tries to reconfigure the interface | defconfig's `BR2_SYSTEM_DHCP` removed; overlay ships a loopback-only `/etc/network/interfaces` |
 | 10 | Data partition doesn't grow to fill card | `resize2fs` fails with "No space left on device while checking for online resizing support" — the 6.6 kernel's ext4 online-resize ioctl has a limitation with the 512 MB → 953 GB jump | Workaround documented: boot once, then manually `mkfs.ext4` the partition at full size and restore state (the appliance's S01 corrupt-data path does exactly this) |
 
-### What's still open
+### RESOLVED: NPU generation quality (2026-09-17)
 
-- **NPU generation quality**: with the card present and the engine armed,
-  generation produces `????????` instead of text. The engine templates
-  load onto the card (CMM populated to 943 MiB) but NPU utilization stays
-  at 0% — layers staged but not executing. The CPU-tier path (any GGUF)
-  is fully proven on hardware. This needs investigation of the whole-layer
-  dispatch/weight-patch path in the fork's backend — likely the Q8_0
-  quant requires the `layout_v4.bin` sidecar that the vendor's pre-built
-  templates don't include.
+**Root cause**: the ggml-axcl backend registered as an ACCEL device whenever
+the card was present. Since it shares the CPU buffer type, llama.cpp's
+scheduler couldn't distinguish them and routed EVERY model's computation
+through the axcl backend's graph path — corrupting logits into pure '?'
+tokens for all models, even with `n_gpu_layers=0` and no env vars set.
+
+**Fix** (two parts):
+1. Fork (`1bddded`): the backend now only registers as a device when
+   `GGML_AXCL_LAYER=1` is explicitly set (opt-in). Without it, the system
+   runs pure CPU.
+2. Engine (`d1dfe8e`): per-model `n_gpu_layers` routing based on engine-set
+   geometry matching. Matching models → NPU path armed; non-matching →
+   CPU only (n_gpu_layers=0).
+
+**Hardware-verified results**:
+
+| model | tier | decode t/s | quality |
+|---|---|---|---|
+| Qwen3-0.6B Q8_0 | NPU whole-layer | **7.4** | coherent reasoning |
+| Qwen2.5-0.5B Q5_0 | CPU fallback | 1.0 | 7/8 evals pass |
+
+Both from the same engine process with card present.

@@ -118,6 +118,19 @@ model's projection shapes with the same toolchain.
   SIGKILLs. Firmware flashing must not be repeated. **A Pi reboot does
   not reset the card** — full wall power is the reliable recovery.
 
+## Measured performance (2026-09-17, on-target)
+
+| model | tier | quant | decode t/s | prefill t/s | quality | notes |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | NPU whole-layer | Q8_0 | **7.4** | **10** | coherent reasoning | 2.6 GB CMM; 28 layer templates + post engine |
+| Qwen2.5-0.5B | CPU fallback | Q5_0 | 1.0 | 2 | 7/8 evals | non-matching geometry → pure CPU |
+
+The NPU speedup is 7.4× over CPU. Lower than the PoC's 24–30 t/s because:
+(1) vendor-compiled templates (not the custom Pulsar2-tuned ones from the
+original research), (2) Q8_0 quant (not Q4_K_M), (3) no layout_v4.bin
+sidecar for GGUF weight patching (using vendor baked-in weights). Speed
+will improve with the user's own optimized template builds.
+
 ## Multi-model notes
 
 - Whole-layer NPU engages for the **first** matching model in a process.
@@ -142,4 +155,5 @@ model's projection shapes with the same toolchain.
 | **on-target boot (real Pi 5 16 GB + AX8850 card)** | **green**: appliance up in 11 s to a serving API at `10.0.0.69`; SSH key auth; admin web UI; model manager; OpenAI-compatible API serving a real completion ("The capital of France is" → "Paris, the capital city of France...") through the Qwen2.5-0.5B GGUF |
 | **AX8850 card: detection + driver + firmware** | **green on hardware**: card enumerated at PCIe `0000:03:00.0` (1f4b:0650), all 5 driver modules loaded (built against the running 6.6.28-v8-16k kernel), firmware pushed + EP handshake complete, `axcl-smi` reports AX650N V3.6.4, 29°C, 943 MiB / 7040 MiB CMM, `/dev/axcl_host` live |
 | **engine accelerator detection on hardware** | **green**: engine reports `accel: {present: true, driver_loaded: true, n_sets: 1, pci_address: "0000:03:00.0"}` — card found, engine set found, NPU path armed |
-| NPU-tier generation (whole-layer decode quality) | templates staged onto the card (CMM populated), but generation produces garbage — investigation needed on the whole-layer dispatch/weight-patch path; the CPU-tier serving path is fully proven on hardware |
+| **NPU-tier generation (whole-layer decode)** | **green**: Qwen3-0.6B Q8_0 generates coherent reasoning at 7.4 t/s decode / 10 t/s prefill with 2.6 GB CMM on card. The opt-in backend registration fix (fork `1bddded` + engine `d1dfe8e`) resolved the garbage-output issue: the backend now only registers as a device when GGML_AXCL_LAYER=1, and the engine arms it per-model only when the geometry matches an installed engine set |
+| **any-GGUF serving ladder on hardware** | **green**: non-matching model (Qwen2.5-0.5B Q5_0) serves on CPU at 1.0 t/s with 7/8 quality evals passing; matching model (Qwen3-0.6B Q8_0) serves on NPU at 7.4 t/s — both from the same process with card present, automatic per-model routing |
