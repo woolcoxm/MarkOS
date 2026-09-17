@@ -1,0 +1,25 @@
+#!/bin/sh
+# S02markos-cpufreq — pin all cores to performance governor.
+#
+# The default Buildroot kernel boots with the powersave governor (1.5 GHz
+# on the Pi 5's A76). For sustained LLM inference, the performance
+# governor (2.4 GHz with arm_boost=1) is essential — the frequency
+# difference alone accounted for a 57% speedup in decode benchmarks
+# (1.5→2.4 GHz: 0.7→1.1 t/s CPU tier on Qwen2.5-0.5B).
+#
+# The appliance has active cooling (installer warns without it) and the
+# workload is bursty (generation followed by idle), so thermal risk is
+# managed by the kernel's hardware thermal throttling which overrides
+# the governor when the SoC exceeds its trip point.
+
+for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
+    [ -w "$cpu/cpufreq/scaling_governor" ] && \
+        echo performance > "$cpu/cpufreq/scaling_governor" 2>/dev/null
+done
+
+# Log the resulting frequency for diagnostics
+freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null)
+[ -n "$freq" ] && \
+    echo "markos-cpufreq: performance governor active (${freq}kHz)" >/dev/console
+
+exit 0

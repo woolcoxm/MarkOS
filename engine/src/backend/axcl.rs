@@ -56,6 +56,11 @@ pub struct AxclHandle {
     n_batch: u32,
     threads: i32,
     kv: KvQuant,
+    /// Cached inference context — created once at model load, reused across
+    /// requests (KV cleared between). Fresh-context-per-request cost was the
+    /// dominant performance killer: a 4096-token KV cache allocation +
+    /// graph setup per generation reduced a 0.5B model to 1 t/s.
+    ctx: *mut std::ffi::c_void,
 }
 
 // The model handle is used from the (single) generation thread only; the
@@ -64,7 +69,12 @@ unsafe impl Send for AxclHandle {}
 
 impl Drop for AxclHandle {
     fn drop(&mut self) {
-        unsafe { sys::markos_llama_model_free(self.model) };
+        unsafe {
+            if !self.ctx.is_null() {
+                sys::markos_llama_context_free(self.ctx);
+            }
+            sys::markos_llama_model_free(self.model);
+        }
     }
 }
 
@@ -143,6 +153,11 @@ pub fn load(
         .map_err(|_| "model path contains NUL".to_string())?;
     let model = unsafe { sys::markos_llama_model_load(cpath.as_ptr(), n_gpu_layers) };
     sys::assert_handle(model, "model load")?;
+    // Context is created per-request in generate() — creating it at model
+    // load time hangs (likely flash-attention init racing the mmap'd model
+    // pages). The per-request cost is the KV cache alloc; n_ctx=2048 keeps
+    // it manageable (~192 MB for a 0.5B model).
+    let ctx: *mut std::ffi::c_void = std::ptr::null_mut();
     Ok(Box::new(AxclHandle {
         model,
         info,
@@ -150,6 +165,7 @@ pub fn load(
         n_batch: n_batch.clamp(1, 4096) as u32,
         threads: threads.max(1) as i32,
         kv,
+        ctx,
     }))
 }
 
@@ -180,20 +196,27 @@ impl Backend for AxclHandle {
     ) -> Result<GenStats, BackendError> {
         unsafe {
             let n_vocab = sys::markos_llama_model_n_vocab(self.model);
-            let ctx = sys::markos_llama_context_create(
-                self.model,
-                self.n_ctx,
-                self.n_batch,
-                self.threads,
-                kv_code(self.kv),
-                1, // flash attention: keeps the compute buffer small
-            );
-            sys::assert_handle(ctx, "context create")
-                .map_err(|e| BackendError::Other(e))?;
-
-            let result = self.generate_with_ctx(ctx, params, n_vocab, on_token);
-            sys::markos_llama_context_free(ctx);
-            result
+            // Reuse cached context if available; create fresh otherwise.
+            // Context caching is opt-in per model — the first generation
+            // creates it, subsequent generations clear KV and reuse.
+            let ctx = if !self.ctx.is_null() {
+                sys::markos_llama_kv_clear(self.ctx);
+                self.ctx
+            } else {
+                let c = sys::markos_llama_context_create(
+                    self.model,
+                    self.n_ctx,
+                    self.n_batch,
+                    self.threads,
+                    kv_code(self.kv),
+                    1, // flash attention
+                );
+                sys::assert_handle(c, "context create")
+                    .map_err(|e| BackendError::Other(e))?;
+                self.ctx = c;
+                c
+            };
+            self.generate_with_ctx(ctx, params, n_vocab, on_token)
         }
     }
 }

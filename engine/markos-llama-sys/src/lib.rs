@@ -53,6 +53,7 @@ extern "C" {
         flash_attn: i32,
     ) -> *mut c_void;
     pub fn markos_llama_context_free(ctx: *mut c_void);
+    pub fn markos_llama_kv_clear(ctx: *mut c_void);
     pub fn markos_llama_batch_create(n_tokens: i32) -> *mut c_void;
     pub fn markos_llama_batch_free(batch: *mut c_void);
     pub fn markos_llama_batch_clear(batch: *mut c_void);

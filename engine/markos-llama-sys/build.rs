@@ -53,6 +53,13 @@ fn main() {
         // portable code; Pi 5 codegen flags arrive via CFLAGS/CXXFLAGS from
         // the Buildroot toolchain env
         .define("GGML_NATIVE", "OFF")
+        // The Buildroot toolchain has no libgomp; with GGML_OPENMP=ON cmake
+        // defines GGML_USE_OPENMP but there's no runtime to back it — ggml
+        // silently falls back to single-threaded compute (1 of 4 cores,
+        // measured as the dominant CPU-tier bottleneck: 1 t/s instead of
+        // 5-10 t/s for a 0.5B model). OFF makes ggml use its built-in
+        // pthread-based thread pool which needs no OpenMP runtime.
+        .define("GGML_OPENMP", "OFF")
         .define("CMAKE_BUILD_TYPE", "Release")
         // out-of-source into OUT_DIR so incremental cargo builds reuse it
         .out_dir(env::var("OUT_DIR").unwrap());

@@ -80,6 +80,12 @@ void markos_llama_context_free(void * c) {
     llama_free((struct llama_context *) c);
 }
 
+// Clear the KV/memory contents — reusable contexts need this between
+// requests so the next generation starts from a clean attention state.
+void markos_llama_kv_clear(void * c) {
+    llama_memory_clear(llama_get_memory((struct llama_context *) c), true);
+}
+
 // ---- batch ----
 
 // The batch struct is kept shim-side; Rust holds the opaque handle.
