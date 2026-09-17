@@ -101,14 +101,47 @@ pub fn load(
     threads: usize,
     kv: KvQuant,
     info: BackendInfo,
+    meta: &crate::gguf::GgufMeta,
 ) -> Result<Box<dyn Backend>, String> {
     backend_init();
+
+    // Decide the serving tier BEFORE loading: only route to the NPU backend
+    // (n_gpu_layers > 0) when the model's geometry matches an installed
+    // engine set. Non-matching models MUST use n_gpu_layers=0 — routing
+    // them to the axcl backend causes graph-splitting between buffer types
+    // that corrupts logits (hardware-verified: every non-matching model
+    // produced pure '?' tokens with n_gpu_layers=99).
+    let sets = crate::axsets::scan(&std::path::Path::new(&crate::accel::engines_root()));
+    let card_present = crate::accel::detect().present;
+    let mode = if card_present {
+        match meta.shape() { Some(s) => crate::axsets::match_mode(&s, &sets), None => crate::axsets::AccelMode::Cpu }
+    } else {
+        crate::axsets::AccelMode::Cpu
+    };
+    let n_gpu_layers: i32 = match &mode {
+        crate::axsets::AccelMode::NpuLayer { .. } => {
+            // Matching model: arm the whole-layer NPU path. These env vars
+            // are read by the fork's backend at first graph compute (lazily,
+            // not cached at init) — safe to set here, just before model load.
+            std::env::set_var("GGML_AXCL_LAYER", "1");
+            std::env::set_var("GGML_AXCL_GGUF", "1");
+            99
+        }
+        _ => {
+            // Non-matching: route to CPU only (n_gpu_layers=0). The axcl
+            // backend is still registered but receives no work from the
+            // scheduler, so the graph computes entirely on the CPU backend.
+            0
+        }
+    };
+    eprintln!(
+        "markos-engine: model {} -> {:?} (n_gpu_layers={})",
+        info.id, mode, n_gpu_layers
+    );
+
     let cpath = CString::new(path.as_os_str().to_string_lossy().as_bytes())
         .map_err(|_| "model path contains NUL".to_string())?;
-    // n_gpu_layers > 0 lets the scheduler route through the registered
-    // ggml-axcl device (whole-layer mode claims the graph there). Without
-    // a card, llama.cpp falls back to CPU transparently.
-    let model = unsafe { sys::markos_llama_model_load(cpath.as_ptr(), 99) };
+    let model = unsafe { sys::markos_llama_model_load(cpath.as_ptr(), n_gpu_layers) };
     sys::assert_handle(model, "model load")?;
     Ok(Box::new(AxclHandle {
         model,

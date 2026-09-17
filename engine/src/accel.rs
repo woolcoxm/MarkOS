@@ -69,10 +69,13 @@ static CONFIGURED: OnceLock<()> = OnceLock::new();
 /// Set the ggml-axcl environment before the first llama.cpp use.
 ///
 /// - `MARKOS_AXCL=0` disables everything (CPU-only boot).
-/// - Sets GGML_AXCL_ENGINES_ROOT + GGML_AXCL_LAYER + GGML_AXCL_GGUF; the
-///   fork itself selects the engine set matching the loaded model's graph
-///   geometry, and retires whole-layer mode cleanly when nothing matches
-///   (per-op matmul / CPU reference keeps serving ANY gguf).
+/// - Sets GGML_AXCL_ENGINES_ROOT (engine-set discovery path) but NOT
+///   GGML_AXCL_LAYER or GGML_AXCL_GGUF — those cause the backend to claim
+///   ALL ops and route every graph through the NPU path, which corrupts
+///   logits for non-matching models (hardware-verified 2026-09-17: every
+///   model produced pure '?' tokens). Instead, the per-model
+///   `n_gpu_layers` check in `backend/axcl.rs` decides whether to route
+///   to the NPU backend based on engine-set geometry matching.
 pub fn configure_once(status: &AccelStatus) {
     CONFIGURED.get_or_init(|| {
         if std::env::var("MARKOS_AXCL").as_deref() == Ok("0") {
@@ -85,16 +88,16 @@ pub fn configure_once(status: &AccelStatus) {
             }
             return;
         }
+        // Engine-set discovery path only — no broad claims, no GGUF mode.
+        // The backend's self-selection (geometry discovery + set matching)
+        // handles the rest per-model via n_gpu_layers.
         std::env::set_var("GGML_AXCL_ENGINES_ROOT", &status.engines_root);
-        std::env::set_var("GGML_AXCL_LAYER", "1");
-        std::env::set_var("GGML_AXCL_GGUF", "1");
         // card-drop resilience (fork defaults: signal guard on, auto-reboot
-        // on EP offline, 15s connect budget) — pin the values so future
-        // fork defaults can't silently change appliance behavior
+        // on EP offline, 15s connect budget)
         std::env::set_var("GGML_AXCL_SIGNAL_GUARD", "1");
         std::env::set_var("GGML_AXCL_CONNECT_TIMEOUT", "15");
         eprintln!(
-            "markos-engine: Axera NPU active ({} engine sets under {}), whole-layer GGUF patching on",
+            "markos-engine: Axera NPU present ({} engine sets under {}), per-model geometry matching",
             status.n_sets, status.engines_root
         );
     });

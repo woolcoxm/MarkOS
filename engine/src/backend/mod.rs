@@ -83,9 +83,9 @@ pub fn open_gguf(
     threads: usize,
     kv: crate::guard::KvQuant,
     info: BackendInfo,
-    _meta: crate::gguf::GgufMeta,
+    meta: crate::gguf::GgufMeta,
 ) -> Result<Box<dyn Backend>, String> {
-    axcl::load(path, n_ctx, n_batch, threads, kv, info)
+    axcl::load(path, n_ctx, n_batch, threads, kv, info, &meta)
 }
 
 #[cfg(all(not(feature = "axcl"), feature = "llama"))]
