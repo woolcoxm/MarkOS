@@ -19,22 +19,18 @@ GENIMAGE_TMP="${BUILD_DIR}/genimage.tmp"
 cp "${BOARD_DIR}/config_5.txt"  "${BIN_DIR}/config.txt"
 cp "${BOARD_DIR}/cmdline.txt"   "${BIN_DIR}/cmdline.txt"
 
-# Boot firmware comes from the official Raspberry Pi OS boot environment,
-# not the buildroot rpi-firmware package: even current-package start4.elf
-# wedges 2026-production d0-stepping boards before the kernel runs, while
-# the Pi OS flavor boots them (verified on hardware 2026-09-16). Downloaded
-# once and cached under os/dl/pios-boot.
-PIOS_BOOT="${BOARD_DIR}/../../dl/pios-boot"
+# Boot firmware is VENDORED in this tree (os/board/markos/bootfw/):
+# hardware-proven on the 2026-production d0-stepping board (verified
+# 2026-09-16 — it booted exactly these bytes). Neither the buildroot
+# rpi-firmware package's start4.elf NOR the 2026-09-15 Raspberry Pi OS
+# release's works: both wedge this board in the bootloader with the
+# 2-long-2-short "failed to read from partition" LED code, before the
+# kernel ever runs. Bump the vendored files only behind a hardware boot
+# gate; do not "freshen" them from a current download.
+PIOS_BOOT="${BOARD_DIR}/bootfw"
 if [ ! -f "${PIOS_BOOT}/start4.elf" ]; then
-	echo "post-image: fetching Raspberry Pi OS boot environment (one-time, cached)"
-	mkdir -p "${PIOS_BOOT}" "${BUILD_DIR}/pios-tmp"
-	curl -sL -o "${BUILD_DIR}/pios-tmp/raspios.img.xz" \
-		"https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2026-09-15/2026-09-15-raspios-trixie-arm64-lite.img.xz"
-	xz -d "${BUILD_DIR}/pios-tmp/raspios.img.xz"
-	BOOT_SECT=$(fdisk -l "${BUILD_DIR}/pios-tmp/raspios.img" | awk '/W95 FAT32/ {print $2; exit}')
-	mcopy -s -o -i "${BUILD_DIR}/pios-tmp/raspios.img@@$((BOOT_SECT * 512))" \
-		"::/start4.elf" "::/fixup4.dat" "::/bootcode.bin" "::/overlays" "${PIOS_BOOT}/"
-	rm -rf "${BUILD_DIR}/pios-tmp"
+	echo "post-image: vendored boot firmware missing (${PIOS_BOOT}/start4.elf)" >&2
+	exit 1
 fi
 
 # Firmware files staged flat for genimage + the overlays tree (injected

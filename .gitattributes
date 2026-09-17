@@ -29,4 +29,9 @@ config_5.txt   text eol=lf
 
 # whole board tree + embedded web assets feed the image build verbatim
 os/board/** text eol=lf
+
+# ...EXCEPT the vendored boot firmware: those are binary blobs that must
+# never be line-normalized (an eol rule here once corrupted start4.elf in
+# the index — caught by comparing blob sha vs the hardware-proven file)
+os/board/markos/bootfw/** binary
 engine/web/** text eol=lf
