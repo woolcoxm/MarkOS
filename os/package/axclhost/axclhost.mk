@@ -28,10 +28,10 @@ define AXCLHOST_INSTALL_STAGING_CMDS
 	# MARKOS_AXCL_ROOT=$(STAGING_DIR)/usr/axcl
 	$(INSTALL) -d $(STAGING_DIR)/usr/axcl/include $(STAGING_DIR)/usr/axcl/lib
 	$(INSTALL) -m 0644 $(AXCLHOST_SITE)/usr/include/axcl/*.h $(STAGING_DIR)/usr/axcl/include/
-	for l in $(AXCLHOST_RUNTIME_LIBS); do \
-		for f in $(AXCLHOST_SITE)/usr/lib/axcl/lib$$l.so.*; do \
-			$(INSTALL) -m 0755 $$f $(STAGING_DIR)/usr/axcl/lib/; \
-		done; \
+	# everything the link line needs, including spdlog (a DT_NEEDED of
+	# libaxcl_rt the linker must see to resolve C++ symbols through the .so)
+	for f in $(AXCLHOST_SITE)/usr/lib/axcl/libaxcl_*.so.* $(AXCLHOST_SITE)/usr/lib/axcl/libspdlog.so.*; do \
+		$(INSTALL) -m 0755 $$f $(STAGING_DIR)/usr/axcl/lib/; \
 	done
 	for f in $(STAGING_DIR)/usr/axcl/lib/*.so.*; do \
 		b="$$(basename $$f)"; ln -sf "$$b" $(STAGING_DIR)/usr/axcl/lib/"$$(echo "$$b" | sed 's/\.so\..*//').so"; \
@@ -39,25 +39,25 @@ define AXCLHOST_INSTALL_STAGING_CMDS
 endef
 
 define AXCLHOST_INSTALL_TARGET_CMDS
-	$(INSTALL) -d $(TARGET_DIR)/usr/lib/axcl
-	for l in $(AXCLHOST_RUNTIME_LIBS); do \
-		$(INSTALL) -m 0755 $(AXCLHOST_SITE)/usr/lib/axcl/lib$$l.so.* $(TARGET_DIR)/usr/lib/axcl/ 2>/dev/null || true; \
-		$(INSTALL) -m 0755 $(AXCLHOST_SITE)/usr/lib/axcl/lib$$l.so $(TARGET_DIR)/usr/lib/axcl/ 2>/dev/null || true; \
+	# NOTE: the deb namespaces its libs under /usr/lib/axcl with an
+	# ld.so.conf.d entry; Buildroot's target finalizer REJECTS custom
+	# ld.so.conf.d, so the runtime goes into the default search path
+	# /usr/lib instead — no loader config needed anywhere.
+	$(INSTALL) -d $(TARGET_DIR)/usr/lib
+	for f in $(AXCLHOST_SITE)/usr/lib/axcl/libaxcl_*.so.* $(AXCLHOST_SITE)/usr/lib/axcl/libspdlog.so.*; do \
+		$(INSTALL) -m 0755 $$f $(TARGET_DIR)/usr/lib/; \
 	done
-	# symlink farm so unversioned/solo-versioned builds both resolve
-	for f in $(TARGET_DIR)/usr/lib/axcl/*.so.*; do \
+	# symlink farm so versioned/unversioned/solo-versioned builds all resolve
+	for f in $(TARGET_DIR)/usr/lib/libaxcl_*.so.* $(TARGET_DIR)/usr/lib/libspdlog.so.*; do \
 		b="$$(basename $$f)"; \
 		case "$$b" in *.so) continue;; esac; \
-		major="$$(echo "$$b" | sed 's/\.so\..*//').so$$(echo "$$b" | sed -n 's/.*\.so\.\([0-9]*\).*/\1/p')"; \
-		ln -sf "$$b" $(TARGET_DIR)/usr/lib/axcl/"$$major"; \
-		ln -sf "$$b" $(TARGET_DIR)/usr/lib/axcl/"$$(echo "$$b" | sed 's/\.so\..*//').so"; \
+		major="$$(echo "$$b" | sed 's/\.so\..*//').so.$$(echo "$$b" | sed -n 's/.*\.so\.\([0-9]*\).*/\1/p')"; \
+		ln -sf "$$b" $(TARGET_DIR)/usr/lib/"$$major"; \
+		ln -sf "$$b" $(TARGET_DIR)/usr/lib/"$$(echo "$$b" | sed 's/\.so\..*//').so"; \
 	done
-	# spdlog is a hard DT_NEEDED of several axcl libs
-	$(INSTALL) -m 0755 $(AXCLHOST_SITE)/usr/lib/axcl/libspdlog.so* $(TARGET_DIR)/usr/lib/axcl/ 2>/dev/null || true
-	# loader config + udev + modules-load + firmware
-	$(INSTALL) -d $(TARGET_DIR)/etc/ld.so.conf.d $(TARGET_DIR)/etc/udev/rules.d \
+	# udev + modules-load + firmware
+	$(INSTALL) -d $(TARGET_DIR)/etc/udev/rules.d \
 		$(TARGET_DIR)/etc/modules-load.d $(TARGET_DIR)/lib/firmware/axcl
-	printf '/usr/lib/axcl\n' > $(TARGET_DIR)/etc/ld.so.conf.d/axcl.conf
 	printf 'ax_pcie_host_dev\nax_pcie_msg\nax_pcie_mmb\naxcl_host\nax_pcie_p2p_rc\n' \
 		> $(TARGET_DIR)/etc/modules-load.d/axcl.conf
 	# the deb's rules use GROUP="<users>" (a literal placeholder) — the

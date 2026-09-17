@@ -122,7 +122,9 @@ pub fn load(
 
 impl AxclHandle {
     fn token_piece(&self, tok: i32) -> String {
-        let mut buf = [0i8; 256];
+        // c_char is i8 on x86_64 but u8 on aarch64 — keep the buffer typed
+        // as c_char so this compiles for both hosts
+        let mut buf = [0 as std::ffi::c_char; 256];
         let n = unsafe { sys::markos_llama_token_to_piece(self.model, tok, buf.as_mut_ptr(), 256) };
         if n <= 0 {
             return String::new();

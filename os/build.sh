@@ -10,6 +10,11 @@ set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 EXT_TREE="$HERE"
 OUT="$HERE/output"
+# Sanitize PATH (same lesson as scripts/engine-build.sh): a Windows-inherited
+# PATH via WSL interop contains spaces, which Buildroot's dependency check
+# refuses — pin a clean Linux PATH with cargo where the engine needs it.
+PATH="/root/.cargo/bin:${HOME:-/root}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 BR_VERSION="${BR_VERSION:-2025.02}"
 VARIANT="sd"
 JOBS="$(nproc 2>/dev/null || echo 4)"
@@ -82,7 +87,7 @@ build_variant() {
 # build consumes an unpacked copy at os/vendor/axclhost-root. Seed it from
 # the dev machine's Axera-refs checkout or a local deb when present.
 VENDOR="$HERE/vendor"
-AXCLHOST_DEB_NAMES="$(ls "$HERE"/../Axera-refs/axclhost_3.6.5-m5stack1_arm64.deb "$HOME"/Downloads/axclhost_3.6.5-m5stack1_arm64.deb 2>/dev/null || true)"
+AXCLHOST_DEB_NAMES="$(ls "$HERE"/../Axera-refs/axclhost_3.6.5-m5stack1_arm64.deb "${HOME:-/root}"/Downloads/axclhost_3.6.5-m5stack1_arm64.deb 2>/dev/null || true)"
 if grep -q "BR2_PACKAGE_AXCLHOST=y" "$HERE/configs/markos_pi5_defconfig" && [ ! -d "$VENDOR/axclhost-root/usr/lib/axcl" ]; then
 	mkdir -p "$VENDOR/axclhost-root"
 	for deb in $AXCLHOST_DEB_NAMES; do

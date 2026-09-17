@@ -131,5 +131,6 @@ model's projection shapes with the same toolchain.
 | fork full cmake build (GGML_AXCL=ON) | green on WSL x86_64 (libllama + libggml-axcl + shim) |
 | engine host tests (mock + axsets/accel units, e2e) | 44/44 green |
 | engine `--features axcl` type-check (WSL, real fork build) | green, zero warnings |
-| Buildroot image build with the new packages | requires the WSL builder (fresh setup after the WSL reset): run `os/build.sh --variant sd` |
-| on-target behavior (module load on 6.18, engine load, NPU decode) | requires the Pi + card — next hardware session |
+| **Buildroot image build** (`os/build.sh --variant sd`, WSL) | **green**: markos-sd.img (1.23 GB) with the axcl variant — AXCL PCIe modules compiled against the 6.18.52 kernel (2 compat fixes: `-Werror=date-time` suppression, `MODULE_IMPORT_NS` string form for ≥6.13), axclhost runtime installed, engine cross-compiled AND linked (aarch64 ELF, `DT_NEEDED libaxcl_rt.so`), depmod'd modules, firmware, udev, modules-load |
+| **appliance boot + serving (QEMU aarch64, no card)** | **green**: healthz OK, admin login OK, `/api/state` reports `accel: {present:false, driver_loaded:false, engines_root:/data/axcl/sets}`; `ggml-axcl: axclInit failed` logged cleanly and the model served on the CPU path — Qwen2.5-0.5B Q4_K_M auto-loaded (`resident:true`) and answered `"The capital of France is" → "Paris..."` over the OpenAI API. This IS the any-GGUF fallback ladder proven in the shipped binary |
+| on-target NPU behavior (module load on real PCIe, engine-set selection, NPU decode) | requires the Pi + card — next hardware session |

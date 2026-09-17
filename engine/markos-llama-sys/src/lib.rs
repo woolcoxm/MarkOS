@@ -10,7 +10,7 @@
 
 #![allow(clippy::missing_safety_doc)]
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 
 /// Mirror of the shim's `struct markos_sampler_cfg` — both layouts are ours.
 #[repr(C)]
@@ -32,14 +32,14 @@ pub struct SamplerCfg {
 
 extern "C" {
     pub fn markos_llama_backend_init() -> i32;
-    pub fn markos_llama_model_load(path: *const i8, n_gpu_layers: i32) -> *mut c_void;
+    pub fn markos_llama_model_load(path: *const c_char, n_gpu_layers: i32) -> *mut c_void;
     pub fn markos_llama_model_free(model: *mut c_void);
     pub fn markos_llama_model_n_vocab(model: *mut c_void) -> i32;
     pub fn markos_llama_vocab_eot(model: *mut c_void) -> i32;
     pub fn markos_llama_vocab_bos(model: *mut c_void) -> i32;
     pub fn markos_llama_tokenize(
         model: *mut c_void,
-        text: *const i8,
+        text: *const c_char,
         add_bos: i32,
         out: *mut i32,
         cap: i32,
@@ -65,7 +65,7 @@ extern "C" {
     pub fn markos_llama_token_to_piece(
         model: *mut c_void,
         token: i32,
-        buf: *mut i8,
+        buf: *mut c_char,
         cap: i32,
     ) -> i32;
 }

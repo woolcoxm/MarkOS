@@ -81,6 +81,7 @@ fn main() {
 fn emit_link_flags(build_dir: PathBuf) {
     // static archives, dependents before dependencies
     println!("cargo:rustc-link-lib=static=llama");
+    println!("cargo:rustc-link-lib=static=ggml");
     println!("cargo:rustc-link-lib=static=ggml-axcl");
     println!("cargo:rustc-link-lib=static=ggml-base");
     println!("cargo:rustc-link-lib=static=ggml-cpu");
@@ -105,4 +106,17 @@ fn emit_link_flags(build_dir: PathBuf) {
     println!("cargo:rustc-link-lib=dylib=axcl_sys");
     println!("cargo:rustc-link-lib=dylib=axcl_pcie_msg");
     println!("cargo:rustc-link-lib=dylib=axcl_pcie_dma");
+    // transitive DT_NEEDED closure of libaxcl_rt (axcl::pkg::*,
+    // axcl::comm::*, axclrtGetToken, spdlog::logger...) — the linker must
+    // see every .so whose symbols are referenced through the chain
+    println!("cargo:rustc-link-lib=dylib=axcl_pkg");
+    println!("cargo:rustc-link-lib=dylib=axcl_comm");
+    println!("cargo:rustc-link-lib=dylib=axcl_token");
+    println!("cargo:rustc-link-lib=dylib=axcl_lite");
+    println!("cargo:rustc-link-lib=dylib=axcl_skel");
+    println!("cargo:rustc-link-lib=dylib=axcl_ppl");
+    println!("cargo:rustc-link-lib=dylib=spdlog");
+    // ggml/llama system deps for the final binary link
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-lib=dylib=m");
 }

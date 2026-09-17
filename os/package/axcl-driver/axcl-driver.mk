@@ -30,20 +30,27 @@ endef
 # Their krules pass KERNEL_BUILD ?= / CROSS := — command-line overrides
 # win over both. Driving their make tree keeps the inter-module
 # KBUILD_EXTRA_SYMBOLS ordering (axcl_host links against host_dev symbols).
+# KCFLAGS: keep their -DIS_THIRD_PARTY_PLATFORM marker and suppress the
+# -Werror=date-time the kernel's reproducible-build flags impose on the
+# driver's __DATE__/__TIME__ version strings.
 define AXCL_DRIVER_BUILD_CMDS
 	$(TARGET_MAKE_ENV) $(MAKE) -C "$(@D)/axcl/drv" host=arm64 \
 		KERNEL_DIR=$(LINUX_DIR) KERNEL_BUILD=$(LINUX_DIR) \
-		CROSS=$(TARGET_CROSS) ARCH=arm64
+		CROSS=$(TARGET_CROSS) ARCH=arm64 \
+		KCFLAGS="-DIS_THIRD_PARTY_PLATFORM -Wno-error=date-time -Wno-date-time"
 endef
 
 define AXCL_DRIVER_INSTALL_TARGET_CMDS
-	$(INSTALL) -d $(TARGET_DIR)/lib/modules/$(LINUX_VERSION)/extra
+	# the kernel release string (uname -r on target) comes from the built
+	# tree — Buildroot's LINUX_VERSION is just "custom" for tarball kernels
+	KREL=$$(cat $(LINUX_DIR)/include/config/kernel.release); \
+	$(INSTALL) -d $(TARGET_DIR)/lib/modules/$$KREL/extra; \
 	cd $(@D) && for m in $(AXCL_DRIVER_MODULES); do \
 		f=$$(find . -name $$m.ko | head -1); \
 		[ -n "$$f" ] || { echo "axcl-driver: $$m.ko not built" >&2; exit 1; }; \
-		$(INSTALL) -m 0644 "$$f" $(TARGET_DIR)/lib/modules/$(LINUX_VERSION)/extra/; \
-	done
-	$(HOST_DIR)/sbin/depmod -b $(TARGET_DIR) $(LINUX_VERSION)
+		$(INSTALL) -m 0644 "$$f" $(TARGET_DIR)/lib/modules/$$KREL/extra/; \
+	done; \
+	$(HOST_DIR)/sbin/depmod -b $(TARGET_DIR) $$KREL
 endef
 
 $(eval $(generic-package))

@@ -1,0 +1,4 @@
+# NOTE: this hashes the pre-seeded git-archive tarball (git archive --prefix=markos-llama-<sha>/ <sha>).
+# After pushing branch axera-any-gguf, regenerate against the codeload tarball if building fresh:
+#   curl -L https://github.com/woolcoxm/llama.cpp/archive/<sha>.tar.gz | sha256sum
+sha256 457cd683312f5311e87e07baedf008e3ea7a13031b6e46c19d895d64e14bc96e  markos-llama-c8d226b4dc94b4eaa7638e5313c2165029dcc17e.tar.gz
