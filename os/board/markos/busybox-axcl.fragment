@@ -1,0 +1,8 @@
+# Busybox config overlay: enable the `timeout` applet. The appliance's
+# init scripts use it for defensive timeouts, and its ABSENCE caused a
+# full hardware debugging saga: `timeout 5 ip link set eth0 up` silently
+# SKIPPED the command ("timeout: not found" swallowed by the shell), so
+# the static network config was decided but never applied to the
+# interface. With this enabled the appliance is also safer against any
+# future script assuming timeout exists.
+CONFIG_TIMEOUT=y

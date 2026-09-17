@@ -1,0 +1,5 @@
+# S03markos-net owns all interface configuration (static plan from the
+# installer, self-healed from the boot FAT). ifup -a in S40network must be
+# a no-op or it fights S03 ("RTNETLINK answers: File exists").
+auto lo
+iface lo inet loopback

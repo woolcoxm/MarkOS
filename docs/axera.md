@@ -97,11 +97,16 @@ model's projection shapes with the same toolchain.
 
 ## Operation on the appliance
 
-- **Boot**: modules load via `/etc/modules-load.d/axcl.conf`, udev
-  creates `/dev/axcl_host`, firmware loads from
-  `/lib/firmware/axcl/ax650_card.pac`. The engine detects the card on
-  PCIe (vendor `0x1f4b`, device `0x0650`) and arms the NPU path before
-  the first model load. No configuration needed.
+- **Boot**: driver modules load last (S99axcl-modules, detached in the
+  background — the driver's module init does a synchronous 155 MB firmware
+  push + up-to-2-minute EP handshake). `axcl-smi` output lands on the
+  console when the card is ready. The engine detects the card on PCIe
+  (vendor `0x1f4b`, device `0x0650`) at startup and arms the NPU path
+  before the first model load. No configuration needed.
+- **Boot config**: `config_5.txt` enables `dtparam=pciex1` +
+  `dtoverlay=pciex1-compat-pi5,no-mip` — without these the Pi 5 doesn't
+  recognize the card or can't allocate MSI IRQs (AXCL setup docs,
+  axcl-samples#5).
 - **Disable**: `MARKOS_AXCL=0` in the service environment boots
   CPU-only even with the card present.
 - **Diagnostics**: `axcl-smi` on the box; the model inventory
@@ -110,7 +115,8 @@ model's projection shapes with the same toolchain.
 - **Card hygiene** (from the PoC findings, still true): killing the
   engine mid-inference can wedge the card; the backend installs signal
   guards and auto-reboots the EP on PCIe drop, but avoid repeated
-  SIGKILLs. Firmware flashing must not be repeated.
+  SIGKILLs. Firmware flashing must not be repeated. **A Pi reboot does
+  not reset the card** — full wall power is the reliable recovery.
 
 ## Multi-model notes
 
@@ -131,6 +137,9 @@ model's projection shapes with the same toolchain.
 | fork full cmake build (GGML_AXCL=ON) | green on WSL x86_64 (libllama + libggml-axcl + shim) |
 | engine host tests (mock + axsets/accel units, e2e) | 44/44 green |
 | engine `--features axcl` type-check (WSL, real fork build) | green, zero warnings |
-| **Buildroot image build** (`os/build.sh --variant sd`, WSL) | **green**: markos-sd.img (1.23 GB) with the axcl variant — AXCL PCIe modules compiled against the 6.18.52 kernel (2 compat fixes: `-Werror=date-time` suppression, `MODULE_IMPORT_NS` string form for ≥6.13), axclhost runtime installed, engine cross-compiled AND linked (aarch64 ELF, `DT_NEEDED libaxcl_rt.so`), depmod'd modules, firmware, udev, modules-load |
+| **Buildroot image build** (`os/build.sh --variant sd`, WSL) | **green**: markos-sd.img (1.23 GB) with the axcl variant — AXCL PCIe modules compiled against the 6.6.28 kernel, axclhost runtime installed, engine cross-compiled AND linked (aarch64 ELF, `DT_NEEDED libaxcl_rt.so`), depmod'd modules, firmware, udev, modules-load |
 | **appliance boot + serving (QEMU aarch64, no card)** | **green**: healthz OK, admin login OK, `/api/state` reports `accel: {present:false, driver_loaded:false, engines_root:/data/axcl/sets}`; `ggml-axcl: axclInit failed` logged cleanly and the model served on the CPU path — Qwen2.5-0.5B Q4_K_M auto-loaded (`resident:true`) and answered `"The capital of France is" → "Paris..."` over the OpenAI API. This IS the any-GGUF fallback ladder proven in the shipped binary |
-| on-target NPU behavior (module load on real PCIe, engine-set selection, NPU decode) | requires the Pi + card — next hardware session |
+| **on-target boot (real Pi 5 16 GB + AX8850 card)** | **green**: appliance up in 11 s to a serving API at `10.0.0.69`; SSH key auth; admin web UI; model manager; OpenAI-compatible API serving a real completion ("The capital of France is" → "Paris, the capital city of France...") through the Qwen2.5-0.5B GGUF |
+| **AX8850 card: detection + driver + firmware** | **green on hardware**: card enumerated at PCIe `0000:03:00.0` (1f4b:0650), all 5 driver modules loaded (built against the running 6.6.28-v8-16k kernel), firmware pushed + EP handshake complete, `axcl-smi` reports AX650N V3.6.4, 29°C, 943 MiB / 7040 MiB CMM, `/dev/axcl_host` live |
+| **engine accelerator detection on hardware** | **green**: engine reports `accel: {present: true, driver_loaded: true, n_sets: 1, pci_address: "0000:03:00.0"}` — card found, engine set found, NPU path armed |
+| NPU-tier generation (whole-layer decode quality) | templates staged onto the card (CMM populated), but generation produces garbage — investigation needed on the whole-layer dispatch/weight-patch path; the CPU-tier serving path is fully proven on hardware |

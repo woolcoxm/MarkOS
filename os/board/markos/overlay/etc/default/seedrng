@@ -1,0 +1,5 @@
+# Seed state persists on the data partition: the root is read-only (squashfs),
+# so the default /var/lib/seedrng silently fails every boot and the CRNG starts
+# cold — which blocked dropbearkey getrandom() through network init (found on
+# hardware 2026-09-17). /data is mounted by S01markos-mounts (sorts first).
+SEEDRNG_ARGS="--seed-dir=/data/state/seedrng"

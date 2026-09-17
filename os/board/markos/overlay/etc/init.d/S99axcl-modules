@@ -1,0 +1,16 @@
+#!/bin/sh
+# S99axcl-modules — load the AXCL PCIe stack LAST and DETACHED: the driver
+# module init pushes 155MB of card firmware over PCIe DMA and runs a
+# blocking RC-EP handshake (up to ~2 minutes per step) inside modprobe —
+# it must never sit inline in the boot path (AXERA-TECH axcl-runtime,
+# axcl_pcie_host_init). Firmware loads only when the card's version
+# differs; repeated flashing can wedge the card (FINDINGS: four flashes
+# in one evening bricked one until a matched-pair reinstall).
+(
+	for m in ax_pcie_host_dev ax_pcie_msg ax_pcie_mmb axcl_host ax_pcie_p2p_rc; do
+		modprobe "$m" 2>&1 | head -2 > /dev/console
+	done
+	sleep 5
+	axcl-smi > /dev/console 2>&1 || true
+) &
+exit 0

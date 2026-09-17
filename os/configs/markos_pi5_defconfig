@@ -10,10 +10,15 @@ BR2_cortex_a76=y
 BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_6_6=y
 BR2_TOOLCHAIN_BUILDROOT_CXX=y
 BR2_GLOBAL_PATCH_DIR="board/raspberrypi/patches"
-BR2_SYSTEM_DHCP="eth0"
+# S03markos-net owns all network config (static from the installer);
+# BR2_SYSTEM_DHCP would make ifup -a fight it (RTNETLINK: File exists).
 BR2_LINUX_KERNEL=y
 BR2_LINUX_KERNEL_CUSTOM_TARBALL=y
-BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION="$(call github,raspberrypi,linux,4bb240615790ea5bd939484f4595b6952ac94ef4)/linux-4bb240615790ea5bd939484f4595b6952ac94ef4.tar.gz"
+# 576cc10e = rpi-6.6.y (the hardware-proven kernel: boots every Pi 5
+# stepping, BCM2712 ethernet reliable, Axera driver compiles cleanly).
+# The 6.18.y pin (4bb24061) caused BCM2712 TX-queue wedging + MODVERSIONS
+# CRC drift — see docs/hardware-debug-2026-09-16.md for the full story.
+BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION="$(call github,raspberrypi,linux,576cc10e1ed50a9eacffc7a05c796051d7343ea4)/linux-576cc10e1ed50a9eacffc7a05c796051d7343ea4.tar.gz"
 BR2_LINUX_KERNEL_DEFCONFIG="bcm2712"
 BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_MARKOS_PATH)/board/markos/kernel-markos.fragment"
 BR2_LINUX_KERNEL_DTS_SUPPORT=y
@@ -40,6 +45,7 @@ BR2_SYSTEM_BIN_SH_BUSYBOX=y
 
 # --- supervision & services ---
 BR2_PACKAGE_BUSYBOX=y
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_MARKOS_PATH)/board/markos/busybox-axcl.fragment"
 BR2_PACKAGE_S6=y
 BR2_PACKAGE_DROPBEAR=y
 # BR2_PACKAGE_DROPBEAR_PASSWORD_AUTH is not set

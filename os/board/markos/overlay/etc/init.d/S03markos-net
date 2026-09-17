@@ -1,32 +1,63 @@
 #!/bin/sh
-# S03markos-net — hostname, provisioning leftovers, WiFi, network config.
-#
-# Persistent network config lives in /data/state (adopted from the
-# installer's boot-FAT copy on first boot, editable via the web UI):
-#   net.conf:   MODE=dhcp | MODE=static IP=... GW=... DNS1=... DNS2=... IFACE=eth0|wlan0
-#   wpa_supplicant.conf  (if WiFi; supports WPA2/WPA3-SAE via wpa_supplicant)
+# S03markos-net — v8: NETWORK FIRST, no timeout wrappers (this busybox has
+# no `timeout` applet — a wrapped command is a silently SKIPPED command,
+# which is how the static config was decided but never applied).
+T() { /usr/bin/markos-trace "S03: $*"; }
 
-# 1. hostname
-if [ -f /data/state/hostname ]; then
-	hostname -F /data/state/hostname
-	cp /data/state/hostname /etc/hostname
-fi
+T "start"
 
-# 2. timezone + locale (from the installer's provision file)
-if [ -s /data/state/tz ]; then
-	cp /data/state/tz /etc/TZ
+# ---- 1. NETWORK FIRST: nothing below may block before the interface serves
+IFACE="eth0"
+MODE="dhcp"
+mkdir -p /data/state
+# adopt the installer plan (FAT) if state is missing
+for f in net.conf ssh-enabled; do
+	if [ ! -f "/data/state/$f" ] && [ -f "/boot/markos/$f" ]; then
+		cp "/boot/markos/$f" "/data/state/$f"
+	fi
+done
+[ -f /data/state/net.conf ] && . /data/state/net.conf
+# SELF-HEAL: FAT plan wins if state is absent or drifted to dhcp
+if [ "$MODE" = "dhcp" ] && [ -f /boot/markos/net.conf ]; then
+	grep -q '^MODE=static' /boot/markos/net.conf && {
+		. /boot/markos/net.conf
+		cp /boot/markos/net.conf /data/state/net.conf
+		T "self-heal: adopted static plan from FAT"
+	}
 fi
-if [ -s /data/state/lang ]; then
+T "1-config: iface=$IFACE mode=$MODE ip=${IP:-none}"
+
+ip link set lo up 2>/dev/null
+ip link set "$IFACE" up 2>/dev/null
+case "$MODE" in
+	static)
+		ip addr flush dev "$IFACE" 2>/dev/null
+		ip addr add "${IP:-192.168.1.50}/24" dev "$IFACE"
+		[ -n "$GW" ] && ip route add default via "$GW" dev "$IFACE"
+		echo "nameserver ${DNS1:-1.1.1.1}" > /etc/resolv.conf
+		[ -n "$DNS2" ] && echo "nameserver $DNS2" >> /etc/resolv.conf
+		command -v arping >/dev/null 2>&1 && \
+			arping -U -c 3 -I "$IFACE" "${IP:-192.168.1.50}" >/dev/null 2>&1 &
+		echo "markos-net: static ${IP:-192.168.1.50}/24 on $IFACE gw ${GW:-none}" >/dev/console
+		;;
+	*)
+		udhcpc -b -i "$IFACE" -p /var/run/udhcpc.pid -x hostname:"$(hostname)" >/dev/null 2>&1 &
+		;;
+esac
+ip addr add 169.254.9.1/16 dev "$IFACE" 2>/dev/null
+T "2-interface-up"
+
+# ---- 2. hostname / tz / locale
+[ -f /data/state/hostname ] && { hostname -F /data/state/hostname; cp /data/state/hostname /etc/hostname; }
+[ -s /data/state/tz ] && cp /data/state/tz /etc/TZ
+[ -s /data/state/lang ] && {
 	echo "export LANG=$(cat /data/state/lang)" > /etc/profile.d/00-lang.sh
 	echo "export LC_ALL=$(cat /data/state/lang)" >> /etc/profile.d/00-lang.sh
-	chmod 644 /etc/profile.d/00-lang.sh
-fi
+}
+T "3-host-tz done"
 
-# 3. dropbear host keys survive in /data/state/etc-seed? Keys live in /etc
-#    (tmpfs on SD). Persist once, restore every boot.
-if [ ! -d /data/state/dropbear ]; then
-	mkdir -p /data/state/dropbear
-fi
+# ---- 3. dropbear keys (persisted; keygen only ever runs on a truly fresh /data)
+[ -d /data/state/dropbear ] || mkdir -p /data/state/dropbear
 if [ -n "$(ls /data/state/dropbear 2>/dev/null)" ]; then
 	mkdir -p /etc/dropbear
 	cp -a /data/state/dropbear/. /etc/dropbear/
@@ -35,19 +66,16 @@ if [ -x /usr/bin/dropbearkey ] && [ ! -f /etc/dropbear/dropbear_rsa_host_key ]; 
 	mkdir -p /etc/dropbear
 	/usr/bin/dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key >/dev/null 2>&1 || true
 fi
-if [ -d /etc/dropbear ]; then
-	cp -a /etc/dropbear/. /data/state/dropbear/ 2>/dev/null || true
-fi
-# authorized_keys are provisioned by the installer into /boot/markos/ and
-# copied to root's home (tmpfs via S01) on every boot.
-if [ -f /boot/markos/authorized_keys ]; then
+[ -d /etc/dropbear ] && cp -a /etc/dropbear/. /data/state/dropbear/ 2>/dev/null
+T "4-dropbear done"
+
+[ -f /boot/markos/authorized_keys ] && {
 	mkdir -p /root/.ssh
 	cp /boot/markos/authorized_keys /root/.ssh/authorized_keys
 	chmod 600 /root/.ssh/authorized_keys
-fi
+}
 
-# Keep the provision snapshot on the boot partition: the factory-reset path
-# (GPIO button / web UI trigger) restores /data/state from it.
+# ---- 4. provision snapshot (factory-reset source)
 if [ -f /boot/markos/provision.env ] || [ -f /boot/markos/net.conf ]; then
 	mount -o remount,rw /boot 2>/dev/null || true
 	mkdir -p /boot/markos-snapshot
@@ -57,71 +85,14 @@ if [ -f /boot/markos/provision.env ] || [ -f /boot/markos/net.conf ]; then
 	sync
 	mount -o remount,ro /boot 2>/dev/null || true
 fi
+T "5-snapshot done"
 
-# 4. loopback + WiFi (if configured) + DHCP/static + always-on IPv4LL rescue
-ip link set lo up 2>/dev/null
-
-# First boot: adopt the installer's plan from the boot FAT into persistent
-# state (the engine provisions accounts, not network). Later edits happen
-# in /data/state via the web UI.
-mkdir -p /data/state
-for f in net.conf ssh-enabled; do
-	if [ ! -f "/data/state/$f" ] && [ -f "/boot/markos/$f" ]; then
-		cp "/boot/markos/$f" "/data/state/$f"
-		echo "markos-net: adopted installer $f from /boot/markos" >/dev/console
-	fi
-done
-
-IFACE="eth0"
-MODE="dhcp"
-[ -f /data/state/net.conf ] && . /data/state/net.conf
-
-if [ -f /data/state/wpa_supplicant.conf ] && [ -e /sys/class/net/wlan0 ]; then
-	ip link set wlan0 up
-	wpa_supplicant -B -i wlan0 -c /data/state/wpa_supplicant.conf -D nl80211 2>/dev/null
-	IFACE="wlan0"
-fi
-[ -n "$IFACE_SET" ] && IFACE="$IFACE_SET"
-ip link set "$IFACE" up 2>/dev/null
-
-case "$MODE" in
-	static)
-		ip addr flush dev "$IFACE" 2>/dev/null
-		ip addr add "${IP:-192.168.1.50}/24" dev "$IFACE"
-		[ -n "$GW" ] && ip route add default via "$GW" dev "$IFACE"
-		echo "nameserver ${DNS1:-1.1.1.1}" > /etc/resolv.conf
-		[ -n "$DNS2" ] && echo "nameserver $DNS2" >> /etc/resolv.conf
-		# Gratuitous ARP: peers + router learn our MAC immediately, and a
-		# conflicting holder of the address answers loudly.
-		command -v arping >/dev/null 2>&1 && \
-			arping -U -c 3 -I "$IFACE" "${IP:-192.168.1.50}" >/dev/null 2>&1 &
-		echo "markos-net: static ${IP:-192.168.1.50}/24 on $IFACE gw ${GW:-none} dns ${DNS1:-1.1.1.1}" >/dev/console
-		;;
-	*)
-		udhcpc -b -i "$IFACE" -p /var/run/udhcpc.pid -x hostname:"$(hostname)" >/dev/null 2>&1 &
-		;;
-esac
-
-# IPv4LL rescue address: a direct laptop cable always reaches the UI at
-# http://169.254.9.1:4444 even with broken LAN config (recovery path #1).
-ip addr add 169.254.9.1/16 dev "$IFACE" 2>/dev/null
-
-# Time sync: no RTC battery on the board, and the clock starts at the
-# image build time — TLS rejects "certificate validity starts in the
-# future" until NTP corrects it. busybox ntpd steps then drifts.
+# ---- 5. ntp + mDNS name + LED heartbeat
 command -v ntpd >/dev/null 2>&1 && ntpd -N -p pool.ntp.org >/dev/null 2>&1 &
-
-# 5. mDNS name advertisement happens via avahi (runsv service); reflect the
-#    configured mdns name from the engine store if present.
 MDNS="$(sed -n 's/.*"mdns_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /var/lib/markos/markos.json 2>/dev/null | head -n1)"
-if [ -n "$MDNS" ] && [ -f /etc/avahi/avahi-daemon.conf ]; then
+[ -n "$MDNS" ] && [ -f /etc/avahi/avahi-daemon.conf ] && \
 	sed -i "s/^host-name=.*/host-name=$MDNS/" /etc/avahi/avahi-daemon.conf
-fi
-
-# 6. ACT LED heartbeat: an across-the-room "kernel + init alive" signal
-#    (replaces the default SD-activity blink; restore via trigger "mmc1").
-if [ -w /sys/class/leds/ACT/trigger ]; then
-	echo heartbeat > /sys/class/leds/ACT/trigger 2>/dev/null
-fi
+[ -w /sys/class/leds/ACT/trigger ] && echo heartbeat > /sys/class/leds/ACT/trigger 2>/dev/null
+T "6-done — S03 COMPLETE"
 
 exit 0

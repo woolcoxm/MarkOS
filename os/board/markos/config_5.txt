@@ -18,6 +18,9 @@ dtparam=uart0=on
 # Hardware watchdog device (/dev/watchdog0) for the last-resort reboot.
 dtparam=watchdog=on
 
-# PCIe for NVMe HATs. Gen 3 is stable on most drives; uncomment on flaky
-# link trains (see docs/recovery.md).
-# dtparam=pciex1_gen=3
+# PCIe: required for NVMe HATs AND the Axera AX8850 M.2 card (AXCL setup
+# docs; without pciex1 + the compat overlay the EP is not recognized /
+# MSI IRQs cannot be allocated — axcl-samples#5). Gen 3 for NVMe drives.
+dtparam=pciex1
+dtparam=pciex1_gen=3
+dtoverlay=pciex1-compat-pi5,no-mip

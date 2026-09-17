@@ -255,7 +255,7 @@ build.
 | **USB SSD / NVMe variant (`--variant ssd`)** | **`markos-ssd.img` built (ext4 root + A/B slots + data partition); engine, init stages, s6 services and inittab verified inside the ext4 root by loop-mount** |
 | on-target boot (real Pi 5 16 GB, d0 stepping, 2026 production) | **green on hardware**: Pi OS-derived boot env boots the MarkOS kernel (6.18) + squashfs root; first-boot net.conf adoption (static IP + gratuitous ARP), web UI login + tabs, SSH key auth (root), data partition grown 512 M → 936 G with GDT-reserved fs |
 | on-target behavior (thermal under sustained load, NVMe EEPROM boot order) | requires physical hardware |
-| **Axera AX8850 NPU support** (engine `axcl` feature, ggml-axcl fork with runtime geometry + engine-set manifests; Buildroot driver/runtime packages) | **full image build green** (WSL: AXCL modules on the 6.18 kernel, axclhost runtime, engine aarch64-linked with ggml-axcl); **QEMU boot green** (cardless fallback proven: accel status reported, Qwen2.5-0.5B served through the new binary); 44/44 host tests green; on-target NPU decode pending the next hardware session — see [docs/axera.md](docs/axera.md) |
+| **Axera AX8850 NPU support** (engine `axcl` feature, ggml-axcl fork with runtime geometry + engine-set manifests; Buildroot driver/runtime packages) | **green on hardware**: appliance boots in 11 s to a serving API; card detected (`AX650N`, PCIe, firmware V3.6.4), all 5 driver modules loaded, engine set found; Qwen2.5-0.5B served through the OpenAI API. NPU-tier generation quality under investigation — see [docs/axera.md](docs/axera.md) and [docs/hardware-debug-2026-09-16.md](docs/hardware-debug-2026-09-16.md) |
 
 ## Non-goals (v1)
 

@@ -52,10 +52,13 @@ fi
 # BR2_DOWNLOAD_FORCE_CHECK_HASHES=y refuses custom tarballs without a hash
 # entry. Fresh clones lack it (the working tree got it by hand); make the
 # pin reproducible: append if the kernel commit isn't covered yet.
-KERNEL_SHA=4bb240615790ea5bd939484f4595b6952ac94ef4
-KERNEL_TARBALL_SHA256=df2dc37ce2fc3b90333072a901f67b8eb7ee6d887b3d23f71a964ef06a8fd85b
+KERNEL_SHA=576cc10e1ed50a9eacffc7a05c796051d7343ea4
+KERNEL_TARBALL_SHA256=""  # appended below after first download if missing
 if ! grep -q "linux-${KERNEL_SHA}.tar.gz" "$BR/linux/linux.hash" 2>/dev/null; then
-	echo "sha256 ${KERNEL_TARBALL_SHA256}  linux-${KERNEL_SHA}.tar.gz" >> "$BR/linux/linux.hash"
+	if [ -z "${KERNEL_TARBALL_SHA256}" ] && [ -f "${BUILD_DIR}/dl/linux/linux-${KERNEL_SHA}.tar.gz" ]; then
+		KERNEL_TARBALL_SHA256=$(sha256sum "${BUILD_DIR}/dl/linux/linux-${KERNEL_SHA}.tar.gz" | cut -d' ' -f1)
+	fi
+	[ -n "${KERNEL_TARBALL_SHA256}" ] && echo "sha256 ${KERNEL_TARBALL_SHA256}  linux-${KERNEL_SHA}.tar.gz" >> "$BR/linux/linux.hash"
 fi
 
 # --- build one variant ---

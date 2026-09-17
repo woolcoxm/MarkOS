@@ -2,4 +2,8 @@
 # runsv: avahi-daemon — mDNS advertisement (markos.local / configured name).
 exec 2>&1
 mkdir -p /var/run/avahi-daemon
+# a killed first instance leaves the pid file behind; libdaemon probes it,
+# any recycled PID reads as alive, and s6 respawns "Daemon already running
+# on PID N" forever (seen 1,429 times in one QEMU boot)
+rm -f /var/run/avahi-daemon/pid
 exec avahi-daemon
