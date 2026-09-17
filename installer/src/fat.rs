@@ -31,6 +31,10 @@ pub struct FatPartition<F: Read + Write + Seek> {
     fat_sectors: u32,
     root_cluster: u32,
     cluster_count: u32,
+    /// FSInfo sector (bpb[48]) and backup-boot sector (bpb[50]); the backup
+    /// FSInfo lives at backup_boot + 1. 0 = absent.
+    fs_info_sector: u32,
+    backup_boot_sector: u32,
     fat: Vec<u8>, // FAT[0] contents in memory
 }
 
@@ -141,6 +145,8 @@ fn load_partition<F: Read + Write + Seek>(mut file: F, base: u64) -> Result<FatP
     let mut fat = vec![0u8; fat_bytes as usize];
     file.read_exact(&mut fat)?;
     file.read_exact(&mut fat)?;
+    let fs_info_sector = u16::from_le_bytes([bpb[48], bpb[49]]) as u32;
+    let backup_boot_sector = u16::from_le_bytes([bpb[50], bpb[51]]) as u32;
     Ok(FatPartition {
         file,
         base,
@@ -152,6 +158,8 @@ fn load_partition<F: Read + Write + Seek>(mut file: F, base: u64) -> Result<FatP
         fat_sectors,
         root_cluster,
         cluster_count: cluster_count.min(u32::MAX as u64) as u32,
+        fs_info_sector,
+        backup_boot_sector,
         fat,
     })
 }
@@ -215,6 +223,42 @@ impl<F: Read + Write + Seek> FatPartition<F> {
                 fat_start + i as u64 * self.fat_sectors as u64 * self.bytes_per_sector as u64,
             ))?;
             self.file.write_all(&self.fat)?;
+        }
+        self.update_fsinfo_free_count()?;
+        Ok(())
+    }
+
+    /// Recompute the free-cluster count and patch it into every FSInfo copy
+    /// (primary + backup). A stale count is exactly what made the Pi 5
+    /// bootloader refuse a boot FAT that Linux mounted happily: mkdosfs
+    /// writes a real count at format time, and this writer allocates
+    /// clusters afterwards without ever refreshing it.
+    fn update_fsinfo_free_count(&mut self) -> Result<(), FatError> {
+        let mut free: u32 = 0;
+        for c in 2..2 + self.cluster_count {
+            if self.fat_entry(c) == FREE_MARK {
+                free += 1;
+            }
+        }
+        let mut sectors = vec![self.fs_info_sector];
+        if self.backup_boot_sector != 0 && self.backup_boot_sector != 0xFFFF {
+            sectors.push(self.backup_boot_sector + 1);
+        }
+        for s in sectors {
+            if s == 0 || s >= self.fat_start_sector {
+                continue; // absent or implausible
+            }
+            let off = self.base + s as u64 * self.bytes_per_sector as u64;
+            let mut buf = vec![0u8; self.bytes_per_sector as usize];
+            self.file.seek(SeekFrom::Start(off))?;
+            self.file.read_exact(&mut buf)?;
+            if buf.len() >= 496 && buf[484..488] == 0x6141_7272u32.to_le_bytes() {
+                buf[488..492].copy_from_slice(&free.to_le_bytes());
+                // next-free hint: 0xFFFFFFFF = no hint (spec-legal)
+                buf[492..496].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+                self.file.seek(SeekFrom::Start(off))?;
+                self.file.write_all(&buf)?;
+            }
         }
         Ok(())
     }
@@ -323,7 +367,11 @@ impl<F: Read + Write + Seek> FatPartition<F> {
         dotdot[0] = b'.';
         dotdot[1] = b'.';
         dotdot[11] |= ATTR_DIRECTORY;
-        Self::set_entry_cluster(&mut dotdot, dir_cluster);
+        // '..' of a FIRST-LEVEL directory is 0 (the root has no cluster in
+        // directory semantics) — writing the root's raw cluster here is
+        // fsck's "Invalid '..' entry" complaint
+        let parent_for_dotdot = if dir_cluster == self.root_cluster { 0 } else { dir_cluster };
+        Self::set_entry_cluster(&mut dotdot, parent_for_dotdot);
         entries[32..64].copy_from_slice(&dotdot);
         self.write_cluster(new_cluster, &entries)?;
 
@@ -485,6 +533,11 @@ impl<F: Read + Write + Seek> FatPartition<F> {
             e[11] = ATTR_LONG_NAME;
             e[12] = 0;
             e[13] = *checksum;
+            // first-cluster field of an LFN slot is reserved-must-be-zero;
+            // leaving it 0xFF is fsck's "start cluster field in VFAT long
+            // filename slot is not 0" complaint
+            e[26] = 0;
+            e[27] = 0;
             // Chars live in slots 1..10, 14..25, 28..31.
             let chunk: Vec<u16> = padded[(seq as usize - 1) * 13..seq as usize * 13].to_vec();
             for (idx, u) in chunk.iter().enumerate() {
@@ -516,8 +569,19 @@ impl<F: Read + Write + Seek> FatPartition<F> {
             if is_dir {
                 return Err(FatError::NotFound(format!("{path} is a directory")));
             }
-            self.write_chain(old_start, content, &mut hint)?;
-            self.update_entry_size(dir_cluster, &fname, content.len() as u32)?;
+            if content.is_empty() {
+                // a 0-byte file carries NO cluster: free the old chain and
+                // zero the entry's first-cluster field (fsck and the Pi
+                // bootloader both flag size-0-with-a-chain as corruption)
+                self.free_chain(old_start);
+                self.update_entry_size(dir_cluster, &fname, 0)?;
+                self.update_entry_cluster(dir_cluster, &fname, 0)?;
+            } else {
+                self.write_chain(old_start, content, &mut hint)?;
+                self.update_entry_size(dir_cluster, &fname, content.len() as u32)?;
+            }
+        } else if content.is_empty() {
+            self.add_entry(dir_cluster, &fname, 0, 0, false, &mut hint)?;
         } else {
             let first = self.alloc_cluster(&mut hint)?;
             self.write_chain(first, content, &mut hint)?;
@@ -553,6 +617,32 @@ impl<F: Read + Write + Seek> FatPartition<F> {
     }
 
     /// Walk a directory path WITHOUT creating anything; None if absent.
+    /// Patch an entry's first-cluster field (FAT32: low word at 26, high
+    /// word at 20).
+    fn update_entry_cluster(&mut self, dir_cluster: u32, name: &str, cluster: u32) -> Result<(), FatError> {
+        let mut data = self.read_chain(dir_cluster)?;
+        let mut i = 0;
+        while i + 32 <= data.len() {
+            let e = &data[i..i + 32];
+            if e[0] == 0x00 {
+                break;
+            }
+            if e[0] != 0xE5 && e[11] & ATTR_LONG_NAME != ATTR_LONG_NAME {
+                if let Some(short) = ShortName::decode(e) {
+                    if short.matches(name) {
+                        data[i + 20..i + 22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
+                        data[i + 26..i + 28].copy_from_slice(&(cluster as u16).to_le_bytes());
+                        let mut hint = 2;
+                        self.write_chain(dir_cluster, &data, &mut hint)?;
+                        return Ok(());
+                    }
+                }
+            }
+            i += 32;
+        }
+        Err(FatError::NotFound(name.to_string()))
+    }
+
     fn find_dir(&mut self, path: &str) -> Result<Option<u32>, FatError> {
         let mut cur = self.root_cluster;
         for part in path.split('/').filter(|p| !p.is_empty()) {
@@ -722,8 +812,10 @@ mod tests {
         fsinfo[484..488].copy_from_slice(&0x61417272u32.to_le_bytes());
         fsinfo[488..492].copy_from_slice(&(cluster_count as u32).to_le_bytes());
         fsinfo[492..496].copy_from_slice(&(1u32).to_le_bytes());
-        let at = reserved as usize * 512;
-        img[at..at + 512].copy_from_slice(&fsinfo);
+        // FSInfo lives at the SECTOR the BPB names (1), plus the backup copy
+        // at backup-boot (6) + 1 — not at the start of the reserved region
+        img[512..1024].copy_from_slice(&fsinfo);
+        img[7 * 512..8 * 512].copy_from_slice(&fsinfo);
         // FAT[0] = 0x0FFFFFF8, FAT[1] = EOC, FAT[2] (root) = EOC
         let fat_off = reserved as usize * 512;
         img[fat_off..fat_off + 4].copy_from_slice(&0x0FFFFFF8u32.to_le_bytes());
@@ -754,6 +846,59 @@ mod tests {
 
     fn cursor(img: Vec<u8>) -> Cursor<Vec<u8>> {
         Cursor::new(img)
+    }
+
+    /// Regression (2026-09-16 hardware incident): a boot FAT that Linux
+    /// mounts happily made the Pi 5 bootloader fail with the 2-long-2-short
+    /// "failed to read from partition" code. Three writer bugs, all fixed:
+    /// stale FSInfo free-cluster count, 0-byte files carrying a cluster
+    /// chain, and LFN slots with 0xFFFF in the reserved cluster field.
+    #[test]
+    fn fsinfo_and_empty_files_stay_spec_clean() {
+        let img = mbr_wrap(&make_fat32_image());
+        let mut c = cursor(img);
+        {
+            let mut part = open_boot_partition(&mut c).expect("open");
+            part.ensure_dir("markos").unwrap();
+            part.write_file("markos/ssh-enabled", b"").unwrap(); // 0-byte flag file
+            part.write_file("markos/provision.env", b"MARKOS_ADMIN_USER=admin
+").unwrap();
+            part.write_file("markos/ssh-enabled", b"").unwrap(); // overwrite stays clean
+        }
+        // reopen the WRITTEN image: structural checks first, raw sectors after
+        let mut raw = c.into_inner();
+        {
+            let mut cur = std::io::Cursor::new(raw.clone());
+            let mut part = open_boot_partition(&mut cur).unwrap();
+            let markos = part.child_dir(part.root_cluster, "markos", &mut 2).unwrap();
+            // 0-byte file: no chain (first cluster 0), size 0
+            let (start, size, _) = part.lookup(markos, "ssh-enabled").unwrap().unwrap();
+            assert_eq!(size, 0);
+            assert!(start < 2, "empty file must not own a cluster, got {start}");
+            // LFN slots carry a zero cluster field
+            let root = part.read_chain(part.root_cluster).unwrap();
+            let mut i = 0;
+            while i + 32 <= root.len() {
+                let e = &root[i..i + 32];
+                if e[11] == ATTR_LONG_NAME {
+                    assert_eq!(&e[26..28], &[0u8, 0], "LFN slot cluster field must be 0");
+                }
+                i += 32;
+            }
+        }
+        // FSInfo free count matches the actual FAT free-cluster count
+        let mut cur2 = std::io::Cursor::new(raw.clone());
+        let part = open_boot_partition(&mut cur2).unwrap();
+        let actual_free = (2..2 + part.cluster_count)
+            .filter(|&cl| part.fat_entry(cl) == FREE_MARK)
+            .count() as u32;
+        drop(part);
+        // partition base is at 1 MiB inside the mbr_wrap'd image; FSInfo is sector 1
+        let bps_off = 1024 * 1024 + 512;
+        let fsinfo = &raw[bps_off..bps_off + 512];
+        assert_eq!(&fsinfo[484..488], &0x6141_7272u32.to_le_bytes(), "FSInfo signature");
+        let recorded = u32::from_le_bytes(fsinfo[488..492].try_into().unwrap());
+        assert_eq!(recorded, actual_free, "FSInfo free count must match the FAT");
     }
 
     #[test]
