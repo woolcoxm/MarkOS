@@ -53,6 +53,7 @@ fi
 # entry. Fresh clones lack it (the working tree got it by hand); make the
 # pin reproducible: append if the kernel commit isn't covered yet.
 KERNEL_SHA=576cc10e1ed50a9eacffc7a05c796051d7343ea4
+BUILD_DIR="$HERE/build-$VARIANT"
 KERNEL_TARBALL_SHA256=""  # appended below after first download if missing
 if ! grep -q "linux-${KERNEL_SHA}.tar.gz" "$BR/linux/linux.hash" 2>/dev/null; then
 	if [ -z "${KERNEL_TARBALL_SHA256}" ] && [ -f "${BUILD_DIR}/dl/linux/linux-${KERNEL_SHA}.tar.gz" ]; then
@@ -108,6 +109,40 @@ if grep -q "BR2_PACKAGE_AXCLHOST=y" "$HERE/configs/markos_pi5_defconfig" && [ ! 
 		echo "engine axcl backend for a CPU-only build." >&2
 		exit 1
 	}
+fi
+
+# --- Card firmware override: quiet fan ---
+# The 3.6.5-m5stack1 deb's card pac runs the card fan at full speed all the
+# time; the 3.6.6-m5stack1 card pac is the quiet variant (PoC-verified
+# serving combo: 3.6.5 runtime + 3.6.6 card firmware — see docs/axera.md).
+# The driver flashes it once at boot when the card's version differs; apply
+# it over whatever the vendor tree carries so a re-seed stays quiet too.
+# The deb is fetched from M5Stack's apt repo when not already on disk.
+AXCL_FW366_NAME="axclhost_3.6.6-m5stack1_arm64.deb"
+AXCL_FW366_DEB="$HERE/../Axera-refs/fwm/${AXCL_FW366_NAME}"
+AXCL_FW366_URL="https://repo.llm.m5stack.com/m5stack-apt-repo/pool/axclhost/binary-arm64/${AXCL_FW366_NAME}"
+AXCL_FW366_SHA256="22e0d8f9e6b5c758dc4b22a0a2343209d0b990ceb1be71e57e4d57c37982bf46"
+if [ ! -f "$AXCL_FW366_DEB" ] && [ -d "$VENDOR/axclhost-root/usr/lib/axcl" ]; then
+	mkdir -p "$(dirname "$AXCL_FW366_DEB")"
+	echo "== fetching quiet-fan card firmware (${AXCL_FW366_NAME}) =="
+	if wget -q -O "${AXCL_FW366_DEB}.part" "$AXCL_FW366_URL"; then
+		echo "${AXCL_FW366_SHA256}  ${AXCL_FW366_DEB}.part" | sha256sum -c - >/dev/null 2>&1 ||
+			{ echo "sha256 mismatch on ${AXCL_FW366_NAME} — refusing" >&2; rm -f "${AXCL_FW366_DEB}.part"; }
+		[ -f "${AXCL_FW366_DEB}.part" ] && mv "${AXCL_FW366_DEB}.part" "$AXCL_FW366_DEB"
+	else
+		rm -f "${AXCL_FW366_DEB}.part"
+		echo "download failed — falling back to the vendored 3.6.5 pac (loud fan)" >&2
+	fi
+fi
+if [ -f "$AXCL_FW366_DEB" ] && [ -d "$VENDOR/axclhost-root/usr/lib/axcl" ]; then
+	tmp="$(mktemp -d)"
+	if ar x "$AXCL_FW366_DEB" --outputdir "$tmp" 2>/dev/null || (cd "$tmp" && ar x "$AXCL_FW366_DEB"); then
+		tar --zstd -xf "$tmp"/data.tar.zst -C "$tmp" ./lib/firmware/axcl/ax650_card.pac
+		cp "$tmp"/lib/firmware/axcl/ax650_card.pac \
+			"$VENDOR/axclhost-root/lib/firmware/axcl/ax650_card.pac"
+		echo "== card firmware: shipping the 3.6.6 pac (quiet fan) =="
+	fi
+	rm -rf "$tmp"
 fi
 
 mkdir -p "$OUT"

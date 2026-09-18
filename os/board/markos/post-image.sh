@@ -103,10 +103,19 @@ mkdir -p "${IMAGES_DIR}/markos-provision-template"
 
 IMG="markos-${ROOTFS_VARIANT}.img"
 # genimage's vfat node cannot embed a directory tree: inject overlays into
-# the finished image's boot FAT directly.
+# the finished image's boot FAT directly. config.txt carries
+# dtoverlay=pciex1-compat-pi5 (Axera M.2 card: MSI IRQ allocation) — a boot
+# FAT without that overlay means the card never enumerates, so a failed
+# injection is a LOUD warning, not a silent `|| true`.
 for IMG in markos-sd.img markos-ssd.img; do
 	[ -f "${IMAGES_DIR}/${IMG}" ] || continue
-	mcopy -s -o -i "${IMAGES_DIR}/${IMG}@@1048576" "${BIN_DIR}/firmware-flat/overlays" ::/ 2>/dev/null || true
+	if [ -d "${BIN_DIR}/firmware-flat/overlays" ]; then
+		if ! mcopy -s -o -i "${IMAGES_DIR}/${IMG}@@1048576" "${BIN_DIR}/firmware-flat/overlays" ::/; then
+			echo "post-image: WARNING — overlay injection into ${IMG} failed; dtoverlay lines will not resolve" >&2
+		fi
+	else
+		echo "post-image: WARNING — no overlays staged; dtoverlay lines in config.txt will not resolve" >&2
+	fi
 done
 IMG="markos-${ROOTFS_VARIANT}.img"
 

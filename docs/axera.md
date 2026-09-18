@@ -117,6 +117,31 @@ model's projection shapes with the same toolchain.
   guards and auto-reboots the EP on PCIe drop, but avoid repeated
   SIGKILLs. Firmware flashing must not be repeated. **A Pi reboot does
   not reset the card** — full wall power is the reliable recovery.
+- **Fan**: there is no host-side fan control — the AXCL API exposes none
+  (`axcl-smi`'s Fan column is officially unsupported; the `axcl_rt`
+  headers have no fan/pwm entry points) and the fan is driven by the
+  card's own firmware. Fan behavior therefore follows the flashed card
+  `.pac`: the **3.6.5-m5stack1 pac runs the fan at full speed all the
+  time**; the **3.6.6-m5stack1 pac is the quiet variant** (PoC-verified
+  serving combo: 3.6.5 runtime + 3.6.6 card firmware, all modes OK). The
+  image ships the 3.6.6 pac — `build.sh` applies it over the vendored
+  3.6.5 tree from `Axera-refs/fwm/axclhost_3.6.6-m5stack1_arm64.deb`
+  (repo.llm.m5stack.com, deb sha256 `22e0d8f9…`, pac sha256
+  `9270e25b…`); the 3.6.5 pac is kept beside it as `ax650_card.pac.3.6.5`.
+  The driver flashes it **once** at boot when the card's version differs
+  (repeated flashing is the card-wedging vector — see the S99axcl-modules
+  header). First boot after the bump: expect the normal slow module-init
+  flash, then a quiet card.
+- **Kernel/module skew hazard**: the AXCL `.ko`s are built against the
+  image's exact kernel (`/lib/modules/<ver>-v8-16k`). If the boot
+  partition and the rootfs slot ever get out of sync (e.g. a stale
+  `kernel=Image` from an older image on the FAT partition booting a newer
+  rootfs), `modprobe` finds no modules for the running kernel, the card
+  never comes up, and — since the fan is card-firmware-driven — the fan
+  runs at the flashed firmware's speed with no host control. Symptom
+  check: `uname -r` vs `ls /lib/modules/`, empty `/proc/modules`,
+  `/dev/axcl_host` missing. Fix is a coherent reflash, not module
+  hacking.
 
 ## Measured performance (2026-09-17, on-target — after the perf deep dive)
 
