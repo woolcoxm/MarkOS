@@ -131,8 +131,17 @@ impl EngineCtx {
             weights_bytes: meta.file_size,
         };
         sysinfo::refresh();
-        let backend = crate::backend::open_gguf(&path, n_ctx, cfg.n_batch, cfg.threads.max(1), cfg.kv_quant, info.clone(), meta)
-            .map_err(crate::models::LoadError::Other)?;
+        let backend = crate::backend::open_gguf(
+            &path,
+            n_ctx,
+            cfg.n_batch,
+            cfg.threads.max(1),
+            cfg.decode_threads(),
+            cfg.kv_quant,
+            info.clone(),
+            meta,
+        )
+        .map_err(crate::models::LoadError::Other)?;
         Ok((backend, est))
     }
 
@@ -157,7 +166,26 @@ impl EngineCtx {
                     let ec = this.engine_config();
                     let mut loader = |c: &ModelConfig| this.load_backend(c).map(|(b, _)| b);
                     match this.manager.acquire(&id, &ec, &mut loader, &cfg) {
-                        Ok(_g) => {
+                        Ok(g) => {
+                            // Warm the tensor path now: the first generate()
+                            // pays context creation (KV alloc, graph reserve)
+                            // and, on the NPU tier, whole-layer engine
+                            // loading — seconds that would otherwise land on
+                            // the first user request. One token, result
+                            // discarded.
+                            let t0 = std::time::Instant::now();
+                            g.with_backend(|be| {
+                                let _ = be.generate(
+                                    &crate::backend::GenParams {
+                                        prompt: "hi".into(),
+                                        max_tokens: 1,
+                                        stop: vec![],
+                                        sampling: Default::default(),
+                                        cancel: Default::default(),
+                                    },
+                                    &mut |_| {},
+                                );
+                            });
                             // keep the slot resident (guard drops but slot stays)
                             this.metrics.record(crate::metrics::LogEntry {
                                 ts: Metrics::now_ms(),
@@ -170,7 +198,10 @@ impl EngineCtx {
                                 gen_tokens: None,
                                 ms: None,
                                 tokps: None,
-                                message: Some("auto-load complete".into()),
+                                message: Some(format!(
+                                    "auto-load complete (warmed in {} ms)",
+                                    t0.elapsed().as_millis()
+                                )),
                             });
                         }
                         Err(e) => {
@@ -198,7 +229,7 @@ impl EngineCtx {
     pub fn inventory(&self, id: &str, n_ctx: Option<u64>) -> Result<serde_json::Value, String> {
         let cfg = self.model_config(id).ok_or_else(|| "unknown model".to_string())?;
         let path = self.model_path(&cfg);
-        let meta = GgufMeta::from_file(&path)?;
+        let meta = GgufMeta::cached(&path)?;
         let shape = meta.shape().ok_or("no architecture metadata")?;
         let n_ctx = n_ctx.unwrap_or(cfg.n_ctx).clamp(1, shape.n_ctx_train);
         let est = guard::estimate_ram(&shape, meta.file_size, n_ctx, cfg.n_batch, cfg.kv_quant);
@@ -238,7 +269,8 @@ impl EngineCtx {
         let mut bytes = 0u64;
         for id in &ids {
             if let Some(cfg) = self.model_config(id) {
-                if let Ok(meta) = GgufMeta::from_file(&self.model_path(&cfg)) {
+                // cached: runs after every request
+                if let Ok(meta) = GgufMeta::cached(&self.model_path(&cfg)) {
                     bytes += meta.file_size;
                 }
             }

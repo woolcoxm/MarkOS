@@ -255,18 +255,54 @@ build.
 | **USB SSD / NVMe variant (`--variant ssd`)** | **`markos-ssd.img` built (ext4 root + A/B slots + data partition); engine, init stages, s6 services and inittab verified inside the ext4 root by loop-mount** |
 | on-target boot (real Pi 5 16 GB, d0 stepping, 2026 production) | **green on hardware**: Pi OS-derived boot env boots the MarkOS kernel (6.18) + squashfs root; first-boot net.conf adoption (static IP + gratuitous ARP), web UI login + tabs, SSH key auth (root), data partition grown 512 M → 936 G with GDT-reserved fs |
 | on-target behavior (thermal under sustained load, NVMe EEPROM boot order) | requires physical hardware |
-| **Axera AX8850 NPU support** (engine `axcl` feature, ggml-axcl fork with runtime geometry + engine-set manifests; Buildroot driver/runtime packages) | **green on hardware, both tiers measured**: NPU tier (Qwen3-0.6B Q8_0, matching engine set) serves coherent reasoning at **7.4 t/s decode / 10 t/s prefill** with 2.6 GB CMM on card; CPU tier (Qwen2.5-0.5B Q5_0, non-matching) serves at **1.0 t/s decode** with **7/8 quality evals passing**. Same engine process, per-model routing: matching models → NPU (7.4× CPU speedup), any other GGUF → CPU (always coherent). Full bring-up story: [docs/hardware-debug-2026-09-16.md](docs/hardware-debug-2026-09-16.md) |
+| **Axera AX8850 NPU support** (engine `axcl` feature, ggml-axcl fork with runtime geometry + engine-set manifests; Buildroot driver/runtime packages) | **green on hardware, both tiers measured**: NPU tier (Qwen3-0.6B Q8_0, matching engine set) serves coherent reasoning at **16.1 t/s decode / 135 t/s prefill** with 2.6 GB CMM on card; CPU tier (Qwen2.5-0.5B Q4_K_M, non-matching) serves at **23.8 t/s decode** with **8/8 quality evals passing**. Same engine process, per-model routing: matching models → NPU, any other GGUF → CPU (always coherent). Full bring-up story: [docs/hardware-debug-2026-09-16.md](docs/hardware-debug-2026-09-16.md) |
 
 ## Measured performance (on-target, Raspberry Pi 5 16 GB + AX8850)
 
 | model | tier | quant | decode t/s | prefill t/s | quality eval | notes |
 |---|---|---|---|---|---|---|
-| Qwen3-0.6B | **NPU** (matching engine set) | Q8_0 | **8.7** | **15** | generates coherent reasoning (Qwen3 thinking mode) | 2.6 GB CMM on card |
-| Qwen2.5-0.5B | CPU (non-matching) | Q5_0 | **1.6** | **4** | 7/8 pass (arithmetic, factual, reasoning) | pure CPU/NEON with 4-core threading |
+| Qwen3-0.6B | **NPU** (matching engine set) | Q8_0 | **16.1** | **135** | coherent reasoning (Qwen3 thinking mode) | 2.6 GB CMM on card |
+| Qwen2.5-0.5B | CPU (non-matching) | Q4_K_M | **23.8** | **94** | 8/8 pass (arithmetic, factual, reasoning) | pure CPU/NEON, 2 decode / 4 prefill threads |
 
-Benchmark suite: `os/output/bench.py` (decode speed 3-run median, prefill
-on ~60-token prompt, 8-prompt quality eval at temperature 0.1).
-E2E + security suite: `os/output/e2e_test.py` (33 tests across 8 categories).
+Streaming decode measured over SSE; first request after boot answers in
+0.3–0.6 s (models auto-load + warm at startup), and warm multi-turn TTFT is
+~0.3 s (prompt-prefix KV reuse — only the new turn is pre-filled).
+
+2026-09-17 perf deep dive, root causes fixed (was: NPU 7.4 t/s, CPU
+1.0–1.9 t/s with 13 s TTFT):
+
+1. **Fork pin was one commit behind the opt-in registration fix** — the
+   appliance built the axcl backend that registers unconditionally whenever
+   the card is up; llama.cpp's scheduler (which can't distinguish it from
+   the CPU backend — shared buffer type) routed CPU-tier computation
+   through the axcl graph path: single-threaded host fallback for decode
+   (2.4 t/s on a 16 t/s-capable stack) and per-request NPU/PCIe probing
+   (13 s TTFT). Pin bumped c8d226b → 1bddded; llama-bench on the same box:
+   tg64 16–23 t/s, pp512 84 t/s — the engine now matches the raw stack.
+2. **Decode/batch thread split** (new `threads_decode` model config,
+   default = half of `threads`): the Pi 5 is memory-bandwidth bound at
+   decode; 2 threads beat 4 (llama-bench tg64: 22.6 vs 16.6 t/s), while
+   prefill keeps every core. Lifted the NPU tier 9.7 → 16.1 t/s too (the
+   whole-layer path's host-side KV staging contended at 4 threads).
+3. **Prompt-prefix KV reuse** (CPU tier): multi-turn chats pre-fill only
+   the new suffix instead of the whole conversation (`llama_memory_seq_rm`
+   through the shim; whole-layer NPU still clears — no partial removal).
+4. **Context caching + boot warmup**: the inference context is created once
+   per model slot; auto-loaded models run a 1-token warmup generation so
+   NPU engine loading lands at boot, not on the first request.
+5. **Per-request host waste removed**: GGUF metadata cached by (mtime,
+   size) and vocab-sized arrays skipped instead of materialized (the engine
+   re-walked the full 150k-token GGUF header on every request); stop-string
+   scan and output copying are O(1)/token instead of O(output²).
+
+Remaining NPU headroom vs the 24–30 t/s PoC is template quality, not host
+code: the vendor Q8_0 templates run ~1.9 ms/layer vs ~1.17 ms/layer for
+Pulsar2-tuned s4 builds — see [docs/axera.md](docs/axera.md).
+
+Benchmark suite: `os/output/bench_final.py` (first-request, decode, prefill,
+multi-turn TTFT), `os/output/bench.py` (quality eval). E2E + security
+suite: `os/output/e2e_test.py` (31 tests across 8 categories, green on the
+final build).
 
 ### Security audit (2026-09-17)
 

@@ -56,7 +56,10 @@ pub struct LlamaHandle {
     info: BackendInfo,
     n_ctx: u32,
     n_batch: u32,
+    /// Decode threads (token generation) — see ModelConfig::decode_threads.
     threads: i32,
+    /// Prefill threads (prompt processing) — every core.
+    threads_batch: i32,
     kv: KvQuant,
 }
 
@@ -65,6 +68,7 @@ pub fn load(
     n_ctx: u64,
     n_batch: u64,
     threads: usize,
+    threads_decode: usize,
     kv: KvQuant,
     info: BackendInfo,
 ) -> Result<Box<dyn Backend>, String> {
@@ -77,7 +81,8 @@ pub fn load(
         info,
         n_ctx: n_ctx.clamp(1, u32::MAX as u64) as u32,
         n_batch: n_batch.clamp(1, 4096) as u32,
-        threads: threads.max(1) as i32,
+        threads: threads_decode.max(1) as i32,
+        threads_batch: threads.max(1) as i32,
         kv,
         model,
     }))
@@ -144,12 +149,17 @@ impl Backend for LlamaHandle {
         use llama_cpp_2::model::AddBos;
         use llama_cpp_2::token::LlamaToken;
 
+        // llama-cpp-2's LlamaContext borrows the model, so a struct-level
+        // cached context would be self-referential; the appliance's axcl
+        // backend (which has its own shim) holds its context across
+        // requests. This upstream-backend path recreates the context per
+        // request.
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(Some(std::num::NonZeroU32::new(self.n_ctx).expect("n_ctx >= 1")))
             .with_n_batch(self.n_batch)
             .with_n_ubatch(self.n_batch)
             .with_n_threads(self.threads)
-            .with_n_threads_batch(self.threads)
+            .with_n_threads_batch(self.threads_batch)
             .with_type_k(Self::kv_cache_type(self.kv))
             .with_type_v(Self::kv_cache_type(self.kv))
             // Flash attention keeps the compute buffer small; the guardrail
@@ -183,6 +193,12 @@ impl Backend for LlamaHandle {
         let mut gen_tokens: u64 = 0;
         let max_tokens = params.max_tokens.max(1) as u64;
         let mut stop_reason: Option<&str> = None;
+        let stop_max = params
+            .stop
+            .iter()
+            .map(|s| s.as_bytes().len())
+            .max()
+            .unwrap_or(0);
 
         // Prefill in n_batch chunks; logits enabled on each chunk's last token.
         for (i, tok) in tokens.iter().enumerate() {
@@ -211,13 +227,24 @@ impl Backend for LlamaHandle {
             let piece = token_piece(&self.model, tok);
             pending.extend_from_slice(piece.as_bytes());
             gen_tokens += 1;
+            let before = out.len();
             emit_utf8(&mut pending, &mut out, on_token);
 
-            let view = String::from_utf8_lossy(&out).into_owned();
-            for s in &params.stop {
-                if !s.is_empty() && view.contains(s.as_str()) {
-                    stop_reason = Some("stop");
-                    break;
+            if stop_max > 0 {
+                // bounded tail scan: a stop string ending in this piece starts
+                // at most stop_max-1 bytes before `before`
+                let mut from = before.saturating_sub(stop_max - 1);
+                let view = loop {
+                    match std::str::from_utf8(&out[from..]) {
+                        Ok(v) => break v,
+                        Err(_) => from += 1,
+                    }
+                };
+                for s in &params.stop {
+                    if !s.is_empty() && view.contains(s.as_str()) {
+                        stop_reason = Some("stop");
+                        break;
+                    }
                 }
             }
             if stop_reason.is_none() && gen_tokens >= max_tokens {

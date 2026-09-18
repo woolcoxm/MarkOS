@@ -54,13 +54,26 @@ pub struct AxclHandle {
     info: BackendInfo,
     n_ctx: u32,
     n_batch: u32,
+    /// Threads for token generation (decode). The Pi 5 is memory-bandwidth
+    /// bound at decode: ~half the cores is measurably faster than all of
+    /// them (llama-bench tg64: 2T 22.6 t/s vs 4T 16.6 t/s, 0.5B Q4_K_M).
     threads: i32,
+    /// Threads for prompt processing (prefill) — every core.
+    threads_batch: i32,
     kv: KvQuant,
+    /// Whole-layer NPU serving for this model (engine set matched). The
+    /// card's memory implementation has no partial KV removal, so prompt
+    /// prefix reuse is CPU-tier only.
+    npu_layer: bool,
     /// Cached inference context — created once at model load, reused across
     /// requests (KV cleared between). Fresh-context-per-request cost was the
     /// dominant performance killer: a 4096-token KV cache allocation +
     /// graph setup per generation reduced a 0.5B model to 1 t/s.
     ctx: *mut std::ffi::c_void,
+    /// Token history resident in the cached context's KV (prompt + generated
+    /// of the last request). Enables prompt-prefix reuse: a multi-turn chat
+    /// only prefills the new suffix instead of the whole conversation.
+    last_tokens: Vec<i32>,
 }
 
 // The model handle is used from the (single) generation thread only; the
@@ -109,6 +122,7 @@ pub fn load(
     n_ctx: u64,
     n_batch: u64,
     threads: usize,
+    threads_decode: usize,
     kv: KvQuant,
     info: BackendInfo,
     meta: &crate::gguf::GgufMeta,
@@ -128,21 +142,19 @@ pub fn load(
     } else {
         crate::axsets::AccelMode::Cpu
     };
-    let n_gpu_layers: i32 = match &mode {
-        crate::axsets::AccelMode::NpuLayer { .. } => {
-            // Matching model: arm the whole-layer NPU path. These env vars
-            // are read by the fork's backend at first graph compute (lazily,
-            // not cached at init) — safe to set here, just before model load.
-            std::env::set_var("GGML_AXCL_LAYER", "1");
-            std::env::set_var("GGML_AXCL_GGUF", "1");
-            99
-        }
-        _ => {
-            // Non-matching: route to CPU only (n_gpu_layers=0). The axcl
-            // backend is still registered but receives no work from the
-            // scheduler, so the graph computes entirely on the CPU backend.
-            0
-        }
+    let npu_layer = matches!(mode, crate::axsets::AccelMode::NpuLayer { .. });
+    let n_gpu_layers: i32 = if npu_layer {
+        // Matching model: arm the whole-layer NPU path. These env vars
+        // are read by the fork's backend at first graph compute (lazily,
+        // not cached at init) — safe to set here, just before model load.
+        std::env::set_var("GGML_AXCL_LAYER", "1");
+        std::env::set_var("GGML_AXCL_GGUF", "1");
+        99
+    } else {
+        // Non-matching: route to CPU only (n_gpu_layers=0). The axcl
+        // backend is still registered but receives no work from the
+        // scheduler, so the graph computes entirely on the CPU backend.
+        0
     };
     eprintln!(
         "markos-engine: model {} -> {:?} (n_gpu_layers={})",
@@ -153,19 +165,20 @@ pub fn load(
         .map_err(|_| "model path contains NUL".to_string())?;
     let model = unsafe { sys::markos_llama_model_load(cpath.as_ptr(), n_gpu_layers) };
     sys::assert_handle(model, "model load")?;
-    // Context is created per-request in generate() — creating it at model
-    // load time hangs (likely flash-attention init racing the mmap'd model
-    // pages). The per-request cost is the KV cache alloc; n_ctx=2048 keeps
-    // it manageable (~192 MB for a 0.5B model).
+    // Context is created lazily on first generate() and then reused for the
+    // lifetime of the slot (KV cleared / trimmed between requests).
     let ctx: *mut std::ffi::c_void = std::ptr::null_mut();
     Ok(Box::new(AxclHandle {
         model,
         info,
         n_ctx: n_ctx.clamp(1, u32::MAX as u64) as u32,
         n_batch: n_batch.clamp(1, 4096) as u32,
-        threads: threads.max(1) as i32,
+        threads: threads_decode.max(1) as i32,
+        threads_batch: threads.max(1) as i32,
         kv,
+        npu_layer,
         ctx,
+        last_tokens: Vec::new(),
     }))
 }
 
@@ -196,34 +209,30 @@ impl Backend for AxclHandle {
     ) -> Result<GenStats, BackendError> {
         unsafe {
             let n_vocab = sys::markos_llama_model_n_vocab(self.model);
-            // Reuse cached context if available; create fresh otherwise.
-            // Context caching is opt-in per model — the first generation
-            // creates it, subsequent generations clear KV and reuse.
-            let ctx = if !self.ctx.is_null() {
-                sys::markos_llama_kv_clear(self.ctx);
-                self.ctx
-            } else {
+            // Context is created on first use and then reused for the
+            // lifetime of the slot. Creation cost (KV alloc + graph build)
+            // is paid once per model load, not once per request.
+            if self.ctx.is_null() {
                 let c = sys::markos_llama_context_create(
                     self.model,
                     self.n_ctx,
                     self.n_batch,
                     self.threads,
+                    self.threads_batch,
                     kv_code(self.kv),
                     1, // flash attention
                 );
-                sys::assert_handle(c, "context create")
-                    .map_err(|e| BackendError::Other(e))?;
+                sys::assert_handle(c, "context create").map_err(BackendError::Other)?;
                 self.ctx = c;
-                c
-            };
-            self.generate_with_ctx(ctx, params, n_vocab, on_token)
+            }
+            self.generate_with_ctx(self.ctx, params, n_vocab, on_token)
         }
     }
 }
 
 impl AxclHandle {
     unsafe fn generate_with_ctx(
-        &self,
+        &mut self,
         ctx: *mut std::ffi::c_void,
         params: &GenParams,
         n_vocab: i32,
@@ -250,6 +259,41 @@ impl AxclHandle {
             });
         }
 
+        // ---- KV strategy: prompt-prefix reuse ----
+        // The cached context still holds last_tokens' KV cells. When the new
+        // prompt shares a prefix with that history (multi-turn chat: system
+        // + prior turns), keep the shared cells and prefill only the suffix.
+        // Whole-layer NPU serving has no partial-removal primitive — it
+        // always clears.
+        let mut common = if self.npu_layer {
+            0
+        } else {
+            self.last_tokens
+                .iter()
+                .zip(tokens.iter())
+                .take_while(|(a, b)| a == b)
+                .count()
+        };
+        // Force at least one prefill step so the sampler reads fresh logits
+        // (also covers the identical-prompt-resubmitted case).
+        common = common.min(tokens.len().saturating_sub(1));
+        let mut reused = false;
+        if self.npu_layer || common == 0 {
+            sys::markos_llama_kv_clear(ctx);
+            self.last_tokens.clear();
+        } else {
+            if sys::markos_llama_memory_seq_rm(ctx, 0, common as i32, -1) == 1 {
+                // drop the trimmed tail from the tracked history too
+                self.last_tokens.truncate(common);
+                reused = true;
+            } else {
+                // memory backend can't trim: start clean
+                sys::markos_llama_kv_clear(ctx);
+                self.last_tokens.clear();
+                common = 0;
+            }
+        }
+
         let batch = sys::markos_llama_batch_create(self.n_batch as i32);
         if batch.is_null() {
             return Err(BackendError::Other("batch alloc".into()));
@@ -261,28 +305,43 @@ impl AxclHandle {
             }
             let rc = (|| -> Result<GenStats, BackendError> {
                 let eos = sys::markos_llama_vocab_eot(self.model);
-                let mut n_cur: i32 = 0;
+                let mut n_cur: i32 = common as i32;
                 let mut pending: Vec<u8> = Vec::new();
                 let mut out: Vec<u8> = Vec::new();
                 let mut gen_tokens: u64 = 0;
                 let max_tokens = params.max_tokens.max(1) as u64;
                 let mut stop_reason: Option<&'static str> = None;
                 let n_batch = self.n_batch as i32;
+                // Longest stop string; suffix scanning only needs to look
+                // back this far per token (a match ending in earlier bytes
+                // was already detected then).
+                let stop_max = params
+                    .stop
+                    .iter()
+                    .map(|s| s.as_bytes().len())
+                    .max()
+                    .unwrap_or(0);
 
-                // chunked prefill, logits on each chunk's last token
-                for (i, tok) in tokens.iter().enumerate() {
-                    let i = i as i32;
-                    let last_of_chunk = (i + 1) % n_batch == 0 || i + 1 == tokens.len() as i32;
-                    sys::markos_llama_batch_add(batch, *tok, i, i32::from(last_of_chunk));
+                // chunked prefill of the uncached suffix, logits on each
+                // chunk's last token
+                for (i, tok) in tokens[common..].iter().enumerate() {
+                    let pos = common as i32 + i as i32;
+                    let last_of_chunk =
+                        (i + 1) % n_batch as usize == 0 || common + i + 1 == tokens.len();
+                    sys::markos_llama_batch_add(batch, *tok, pos, i32::from(last_of_chunk));
                     if last_of_chunk {
                         let rc = sys::markos_llama_decode(ctx, batch);
                         if rc != 0 {
                             return Err(BackendError::Other(format!("prefill decode rc={rc}")));
                         }
                         sys::markos_llama_batch_clear(batch);
-                        n_cur = i + 1;
+                        n_cur = pos + 1;
                     }
                 }
+                // the whole prompt is now resident in KV — record it so the
+                // next request can reuse the prefix
+                let recorded = self.last_tokens.len();
+                self.last_tokens.extend_from_slice(&tokens[recorded..]);
 
                 loop {
                     let tok = sys::markos_llama_sampler_sample(smpl, ctx, -1);
@@ -294,13 +353,23 @@ impl AxclHandle {
                     let piece = self.token_piece(tok);
                     pending.extend_from_slice(piece.as_bytes());
                     gen_tokens += 1;
+                    let before = out.len();
                     emit_utf8(&mut pending, &mut out, on_token);
 
-                    let view = String::from_utf8_lossy(&out).into_owned();
-                    for s in &params.stop {
-                        if !s.is_empty() && view.contains(s.as_str()) {
-                            stop_reason = Some("stop");
-                            break;
+                    if stop_max > 0 {
+                        // scan a bounded tail instead of the whole output
+                        let mut from = before.saturating_sub(stop_max - 1);
+                        let view = loop {
+                            match std::str::from_utf8(&out[from..]) {
+                                Ok(v) => break v,
+                                Err(_) => from += 1,
+                            }
+                        };
+                        for s in &params.stop {
+                            if !s.is_empty() && view.contains(s.as_str()) {
+                                stop_reason = Some("stop");
+                                break;
+                            }
                         }
                     }
                     if stop_reason.is_none() && gen_tokens >= max_tokens {
@@ -321,6 +390,8 @@ impl AxclHandle {
                     if rc != 0 {
                         return Err(BackendError::Other(format!("decode rc={rc}")));
                     }
+                    // the token is now resident in KV (position n_cur)
+                    self.last_tokens.push(tok);
                     n_cur += 1;
                 }
 
@@ -333,10 +404,23 @@ impl AxclHandle {
                     stop_reason: stop_reason.unwrap_or("stop").to_string(),
                 })
             })();
+            if rc.is_err() {
+                // KV contents no longer correspond to last_tokens — force a
+                // full clear on the next request.
+                self.last_tokens.clear();
+                sys::markos_llama_kv_clear(ctx);
+            }
             sys::markos_llama_sampler_free(smpl);
             rc
         })();
         sys::markos_llama_batch_free(batch);
+        if reused {
+            eprintln!(
+                "markos-engine: prompt cache hit: {}/{} tokens reused",
+                common,
+                tokens.len()
+            );
+        }
         rc
     }
 }

@@ -49,11 +49,13 @@ extern "C" {
         n_ctx: u32,
         n_batch: u32,
         threads: i32,
+        threads_batch: i32,
         kv_type: i32,
         flash_attn: i32,
     ) -> *mut c_void;
     pub fn markos_llama_context_free(ctx: *mut c_void);
     pub fn markos_llama_kv_clear(ctx: *mut c_void);
+    pub fn markos_llama_memory_seq_rm(ctx: *mut c_void, seq_id: i32, pos0: i32, pos1: i32) -> i32;
     pub fn markos_llama_batch_create(n_tokens: i32) -> *mut c_void;
     pub fn markos_llama_batch_free(batch: *mut c_void);
     pub fn markos_llama_batch_clear(batch: *mut c_void);

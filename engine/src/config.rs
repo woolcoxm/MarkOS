@@ -198,7 +198,13 @@ pub struct ModelConfig {
     pub file: String,
     pub n_ctx: u64,
     pub n_batch: u64,
+    /// Threads for prompt processing (prefill). Every core.
     pub threads: usize,
+    /// Threads for token generation (decode). None = half of `threads`
+    /// (min 1): the Pi 5 decodes fastest below full occupancy because the
+    /// LLM path is memory-bandwidth bound (llama-bench tg64 on a 0.5B
+    /// Q4_K_M: 2 threads 22.6 t/s, 4 threads 16.6 t/s).
+    pub threads_decode: Option<usize>,
     pub kv_quant: KvQuant,
     /// Custom Jinja2-style chat template (minijinja). None = use the GGUF's
     /// embedded template, falling back to a plain-text renderer.
@@ -211,6 +217,14 @@ pub struct ModelConfig {
     pub source: Option<String>,
 }
 
+impl ModelConfig {
+    /// Effective decode thread count (see `threads_decode`).
+    pub fn decode_threads(&self) -> usize {
+        self.threads_decode
+            .unwrap_or_else(|| (self.threads / 2).max(1))
+    }
+}
+
 impl Default for ModelConfig {
     fn default() -> Self {
         ModelConfig {
@@ -220,6 +234,7 @@ impl Default for ModelConfig {
             n_ctx: 4096,
             n_batch: 512,
             threads: 4,
+            threads_decode: None,
             kv_quant: KvQuant::F16,
             chat_template: None,
             system_prompt: None,

@@ -57,15 +57,20 @@ int markos_llama_tokenize(void * m, const char * text, int add_bos,
 // ---- context ----
 
 // kv_type: 0 = f16, 1 = q8_0, 2 = q4_0. flash_attn: 1 = enabled.
+// threads drives token (decode) generation; threads_batch drives prompt
+// processing. The Pi 5 decodes fastest at ~threads/2 (memory-bandwidth
+// bound) while prefill still wants every core — hardware-measured
+// (llama-bench tg64: 2T 22.6 t/s vs 4T 16.6 t/s on a 0.5B Q4_K_M).
 void * markos_llama_context_create(void * m, unsigned n_ctx, unsigned n_batch,
-                                   int threads, int kv_type, int flash_attn) {
+                                   int threads, int threads_batch, int kv_type,
+                                   int flash_attn) {
     struct llama_context_params cp = llama_context_default_params();
     cp.n_ctx = n_ctx;
     cp.n_batch = n_batch;
     cp.n_ubatch = n_batch;
     cp.n_seq_max = 1;
     cp.n_threads = threads;
-    cp.n_threads_batch = threads;
+    cp.n_threads_batch = threads_batch;
     switch (kv_type) {
         case 1: cp.type_k = GGML_TYPE_Q8_0; cp.type_v = GGML_TYPE_Q8_0; break;
         case 2: cp.type_k = GGML_TYPE_Q4_0; cp.type_v = GGML_TYPE_Q4_0; break;
@@ -84,6 +89,19 @@ void markos_llama_context_free(void * c) {
 // requests so the next generation starts from a clean attention state.
 void markos_llama_kv_clear(void * c) {
     llama_memory_clear(llama_get_memory((struct llama_context *) c), true);
+}
+
+// Drop KV cells for `seq` with positions in [pos0, pos1) (pos1 < 0 = open
+// end). This is the primitive behind prompt-prefix reuse: keep the shared
+// prefix's KV, trim the diverged tail, prefill only the suffix.
+// Returns 1 when the memory implementation removed cells, 0 otherwise
+// (backends without partial-removal support — the NPU whole-layer path —
+// must keep using kv_clear).
+int markos_llama_memory_seq_rm(void * c, int seq_id, int pos0, int pos1) {
+    llama_memory_t mem = llama_get_memory((struct llama_context *) c);
+    if (mem == NULL) return 0;
+    return llama_memory_seq_rm(mem, (llama_seq_id) seq_id,
+                               (llama_pos) pos0, (llama_pos) pos1) ? 1 : 0;
 }
 
 // ---- batch ----

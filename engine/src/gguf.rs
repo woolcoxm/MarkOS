@@ -338,6 +338,16 @@ fn read_value<R: Read>(r: &mut Reader<R>, vt: u32, depth: u32) -> Result<Option<
                 }
                 return Ok(None);
             }
+            if count > 4096 {
+                // Vocab-sized arrays (tokens/merges/token_type, 100k+ entries)
+                // are never consumed by the serving layer — the llama.cpp
+                // tokenizer owns that data. Materializing them per parse cost
+                // several MB of string joins on every metadata read; skip.
+                for _ in 0..count {
+                    skip_value(r, evt, depth + 1)?;
+                }
+                return Ok(None);
+            }
             let mut out: Vec<MetaValue> = Vec::new();
             for _ in 0..count {
                 match read_value(r, evt, depth + 1)? {
@@ -369,6 +379,34 @@ impl GgufMeta {
         let mut m = Self::from_reader(&mut f)?;
         m.file_size = file_size;
         Ok(m)
+    }
+
+    /// Metadata for `path`, cached by (mtime, size) so request-path callers
+    /// (chat template resolution, inventory, resident-metrics) never re-walk
+    /// the GGUF header per request. Models are immutable once downloaded, so
+    /// a stat-only invalidation is exact.
+    pub fn cached(path: &Path) -> Result<std::sync::Arc<GgufMeta>, String> {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+        use std::sync::{Arc, OnceLock, RwLock};
+        static CACHE: OnceLock<RwLock<HashMap<PathBuf, (SystemTimeMeta, Arc<GgufMeta>)>>> =
+            OnceLock::new();
+        type SystemTimeMeta = (std::time::SystemTime, u64);
+        let md = std::fs::metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+        let key: SystemTimeMeta = (md.modified().unwrap_or(std::time::UNIX_EPOCH), md.len());
+        let cache = CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+        if let Ok(map) = cache.read() {
+            if let Some((k, v)) = map.get(path) {
+                if *k == key {
+                    return Ok(v.clone());
+                }
+            }
+        }
+        let meta = Arc::new(Self::from_file(path)?);
+        if let Ok(mut map) = cache.write() {
+            map.insert(path.to_path_buf(), (key, meta.clone()));
+        }
+        Ok(meta)
     }
 
     pub fn from_reader<R: Read>(data: &mut R) -> Result<GgufMeta, String> {

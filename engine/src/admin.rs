@@ -218,7 +218,7 @@ fn state(ctx: &Arc<EngineCtx>, req: &Request, out: &mut ResponseOut) {
                 "auto_load": m.auto_load, "source": m.source,
                 "resident": resident.contains(&m.id),
                 "size_bytes": size, "on_disk": exists,
-                "quant": crate::gguf::GgufMeta::from_file(&path).map(|g| g.quant_label()).unwrap_or_else(|_| "?".into()),
+                "quant": crate::gguf::GgufMeta::cached(&path).map(|g| g.quant_label()).unwrap_or_else(|_| "?".into()),
                 "slots": ctx.slots().into_iter().filter(|s| s.model_id == m.id).collect::<Vec<_>>(),
             })
         })

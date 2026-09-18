@@ -118,18 +118,50 @@ model's projection shapes with the same toolchain.
   SIGKILLs. Firmware flashing must not be repeated. **A Pi reboot does
   not reset the card** — full wall power is the reliable recovery.
 
-## Measured performance (2026-09-17, on-target)
+## Measured performance (2026-09-17, on-target — after the perf deep dive)
 
 | model | tier | quant | decode t/s | prefill t/s | quality | notes |
 |---|---|---|---|---|---|---|
-| Qwen3-0.6B | NPU whole-layer | Q8_0 | **7.4** | **10** | coherent reasoning | 2.6 GB CMM; 28 layer templates + post engine |
-| Qwen2.5-0.5B | CPU fallback | Q5_0 | 1.0 | 2 | 7/8 evals | non-matching geometry → pure CPU |
+| Qwen3-0.6B | NPU whole-layer | Q8_0 | **16.1** | **135** | coherent reasoning | 2.6 GB CMM; 28 layer templates + post engine |
+| Qwen2.5-0.5B | CPU fallback | Q4_K_M | **23.8** | **94** | 8/8 evals | non-matching geometry → pure CPU, 2T decode / 4T prefill |
 
-The NPU speedup is 7.4× over CPU. Lower than the PoC's 24–30 t/s because:
-(1) vendor-compiled templates (not the custom Pulsar2-tuned ones from the
-original research), (2) Q8_0 quant (not Q4_K_M), (3) no layout_v4.bin
-sidecar for GGUF weight patching (using vendor baked-in weights). Speed
-will improve with the user's own optimized template builds.
+First request after boot: 0.3–0.6 s TTFT (auto-load + warmup); warm
+multi-turn TTFT ~0.3 s (prompt-prefix KV reuse on the CPU tier).
+
+### Where the earlier numbers went wrong (2026-09-17 perf deep dive)
+
+The first hardware measurements (NPU 7.4 t/s, CPU 1.0–1.9 t/s with a 13 s
+time-to-first-token) were not template-limited — they were **engine-limited
+by a stale fork pin**:
+
+- The Buildroot pin (`c8d226b`) predated the fork's opt-in device
+  registration (`1bddded`). With the card up, the axcl backend registered
+  unconditionally and — sharing the CPU buffer type — the llama.cpp
+  scheduler handed it CPU-tier graphs. Its host fallback computes
+  **single-threaded** (2.4 t/s where the raw fork does 16–23 t/s), and each
+  request paid NPU/PCIe probing (the 13 s TTFT).
+- **Fix**: pin bumped to `1bddded` (`os/package/markos-llama/markos-llama.mk`)
+  + engine-side decode/prefill thread split (`threads_decode`, default half
+  of `threads` — the Pi 5 decodes fastest at 2 of 4 cores: llama-bench tg64
+  22.6 t/s @ 2T vs 16.6 @ 4T), prompt-prefix KV reuse, context caching with
+  boot warmup, and GGUF-metadata caching. Cross-checked with a CPU-only
+  `llama-bench` built from the same fork: tg64 16.2/22.6/16.6 t/s at
+  1/2/4 threads, pp512 84.5 t/s — the engine now matches the raw stack.
+
+### Remaining headroom vs the PoC's 24–30 t/s
+
+Not host code — **template quality and engine-set builds** (the PoC plan in
+`Axera-AX8850-GGUF-Support/PERF-PLAN.md`):
+
+1. Vendor Q8_0 templates run ~1.9 ms/layer; Pulsar2-tuned s4/GPTQ builds
+   ~1.17 ms/layer (PoC baseline 24.3 t/s). Rebuilding the qwen3-0.6B set
+   with the s4 flow is the single biggest lever.
+2. `kv1024` engine set: ~0.93 ms/layer → ~28 t/s at ctx ≤ 1024.
+3. Trimmed post engine (90.9k → ~55k kept vocab rows): −3 to −5 ms/token.
+4. Host-path diet (Phase 1: getenv storm, claim table, KV-flush spread) is
+   still open upstream; worth ~0.5–1 ms/token — apply it when building the
+   new template set so one fork push covers both.
+5. Speculative verification (Phase 5) for the 2–3× endgame.
 
 ## Multi-model notes
 
@@ -155,5 +187,5 @@ will improve with the user's own optimized template builds.
 | **on-target boot (real Pi 5 16 GB + AX8850 card)** | **green**: appliance up in 11 s to a serving API at `10.0.0.69`; SSH key auth; admin web UI; model manager; OpenAI-compatible API serving a real completion ("The capital of France is" → "Paris, the capital city of France...") through the Qwen2.5-0.5B GGUF |
 | **AX8850 card: detection + driver + firmware** | **green on hardware**: card enumerated at PCIe `0000:03:00.0` (1f4b:0650), all 5 driver modules loaded (built against the running 6.6.28-v8-16k kernel), firmware pushed + EP handshake complete, `axcl-smi` reports AX650N V3.6.4, 29°C, 943 MiB / 7040 MiB CMM, `/dev/axcl_host` live |
 | **engine accelerator detection on hardware** | **green**: engine reports `accel: {present: true, driver_loaded: true, n_sets: 1, pci_address: "0000:03:00.0"}` — card found, engine set found, NPU path armed |
-| **NPU-tier generation (whole-layer decode)** | **green**: Qwen3-0.6B Q8_0 generates coherent reasoning at 7.4 t/s decode / 10 t/s prefill with 2.6 GB CMM on card. The opt-in backend registration fix (fork `1bddded` + engine `d1dfe8e`) resolved the garbage-output issue: the backend now only registers as a device when GGML_AXCL_LAYER=1, and the engine arms it per-model only when the geometry matches an installed engine set |
-| **any-GGUF serving ladder on hardware** | **green**: non-matching model (Qwen2.5-0.5B Q5_0) serves on CPU at 1.0 t/s with 7/8 quality evals passing; matching model (Qwen3-0.6B Q8_0) serves on NPU at 7.4 t/s — both from the same process with card present, automatic per-model routing |
+| **NPU-tier generation (whole-layer decode)** | **green**: Qwen3-0.6B Q8_0 generates coherent reasoning at 16.1 t/s decode / 135 t/s prefill with 2.6 GB CMM on card. The opt-in backend registration fix (fork `1bddded` + engine `d1dfe8e`) resolved the garbage-output issue: the backend now only registers as a device when GGML_AXCL_LAYER=1, and the engine arms it per-model only when the geometry matches an installed engine set. **The appliance image must pin ≥ 1bddded** — building from `c8d226b` re-introduces the single-threaded CPU-tier pathology (see measured performance above) |
+| **any-GGUF serving ladder on hardware** | **green**: non-matching model (Qwen2.5-0.5B Q4_K_M) serves on CPU at 23.8 t/s with 8/8 quality evals passing; matching model (Qwen3-0.6B Q8_0) serves on NPU at 16.1 t/s — both from the same process with card present, automatic per-model routing |

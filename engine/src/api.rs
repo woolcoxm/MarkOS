@@ -127,7 +127,7 @@ pub fn resolve_model(ctx: &EngineCtx, want: Option<&str>, profile: Option<&str>)
     let gguf_template = ctx
         .model_config(&cfg.id)
         .map(|c| ctx.model_path(&c))
-        .and_then(|p| crate::gguf::GgufMeta::from_file(&p).ok())
+        .and_then(|p| crate::gguf::GgufMeta::cached(&p).ok())
         .and_then(|m| m.chat_template());
     Ok(Resolved { cfg, profile_name: pname, profile: prof, gguf_template })
 }
@@ -147,7 +147,7 @@ pub fn list_models(ctx: &EngineCtx, out: &mut ResponseOut) {
             "created": 0,
             "markos": {
                 "resident": resident.contains(&m.id),
-                "quant": crate::gguf::GgufMeta::from_file(&path).map(|g| g.quant_label()).unwrap_or_else(|_| "unknown".into()),
+                "quant": crate::gguf::GgufMeta::cached(&path).map(|g| g.quant_label()).unwrap_or_else(|_| "unknown".into()),
                 "size_bytes": size,
             }
         }));

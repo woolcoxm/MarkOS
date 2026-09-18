@@ -81,11 +81,12 @@ pub fn open_gguf(
     n_ctx: u64,
     n_batch: u64,
     threads: usize,
+    threads_decode: usize,
     kv: crate::guard::KvQuant,
     info: BackendInfo,
     meta: crate::gguf::GgufMeta,
 ) -> Result<Box<dyn Backend>, String> {
-    axcl::load(path, n_ctx, n_batch, threads, kv, info, &meta)
+    axcl::load(path, n_ctx, n_batch, threads, threads_decode, kv, info, &meta)
 }
 
 #[cfg(all(not(feature = "axcl"), feature = "llama"))]
@@ -94,11 +95,12 @@ pub fn open_gguf(
     n_ctx: u64,
     n_batch: u64,
     threads: usize,
+    threads_decode: usize,
     kv: crate::guard::KvQuant,
     info: BackendInfo,
     _meta: crate::gguf::GgufMeta,
 ) -> Result<Box<dyn Backend>, String> {
-    llama::load(path, n_ctx, n_batch, threads, kv, info)
+    llama::load(path, n_ctx, n_batch, threads, threads_decode, kv, info)
 }
 
 #[cfg(not(any(feature = "llama", feature = "axcl")))]
@@ -107,6 +109,7 @@ pub fn open_gguf(
     n_ctx: u64,
     n_batch: u64,
     threads: usize,
+    _threads_decode: usize,
     _kv: crate::guard::KvQuant,
     _info: BackendInfo,
     _meta: crate::gguf::GgufMeta,
