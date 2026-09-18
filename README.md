@@ -104,11 +104,14 @@ git clone https://github.com/woolcoxm/MarkOS.git && cd MarkOS/os
 ```
 
 Artifacts land in `os/output/`: `markos-sd.img` (+ `.sha256`) and
-`markos-ssd.img`. First run downloads Buildroot, the Raspberry Pi kernel
-(`rpi-6.18.y`), the official Pi OS boot environment (cached under `os/dl/`),
-and cross-compiles the engine with llama.cpp — about an hour; subsequent
-builds are incremental (minutes). Validate a build in QEMU first if you
-like: see [docs/build.md](docs/build.md).
+`markos-ssd.img`. First run downloads Buildroot, the hardware-proven
+Raspberry Pi kernel (`rpi-6.6.y`, pinned by commit — 6.18.y wedges BCM2712
+Ethernet, see `os/configs/markos_pi5_defconfig`), the vendored Pi OS boot
+environment, the M5Stack card firmware for Axera builds (pinned sha256, from
+M5Stack's apt repo), all cached under `os/dl/` — and cross-compiles the
+engine with llama.cpp. About an hour; subsequent builds are incremental
+(minutes). Validate a build in QEMU first if you like: see
+[docs/build.md](docs/build.md).
 
 ### 2. Write your configuration
 
@@ -220,6 +223,39 @@ The deploy lands the binary on `/data/bin` and repoints the service (the
 Keeper changes go into the source tree and ride along with the next image
 build.
 
+### 9. Axera NPU card (optional — M5Stack LLM-8850)
+
+The M.2 slot takes M5Stack's AX8850 card; the image auto-detects it and
+routes each model to NPU or CPU per its geometry — no configuration. What
+the image handles for you (2026-09-18 onwards):
+
+- **Quiet-fan card firmware ships in the image.** The card's fan is driven
+  by its own firmware (there is no host-side control), and the fanless-
+  runtime variant of M5Stack's `axclhost` deb ships a card firmware whose
+  fan runs at full speed permanently. The build fetches the quiet variant
+  (`axclhost_3.6.6-m5stack1_arm64.deb`, pinned sha256) from M5Stack's apt
+  repo and flashes that instead — the old loud pac is what you get if you
+  install the M5Stack runtime by hand.
+- **First boot after a card-firmware change runs a one-time flash**: the
+  driver's module init pushes ~155 MB to the card and waits for the EP
+  handshake — expect the boot to take 1–3 minutes longer exactly once,
+  then settle. Never re-flash the card repeatedly; a wedged card only
+  recovers on full wall power.
+- **Serving**: matching-geometry models run whole-layer on the NPU
+  (Qwen3-0.6B Q8_0: 16.1 t/s decode / 135 t/s prefill), every other GGUF
+  falls back to the CPU/NEON tier (Qwen2.5-0.5B Q4_K_M: 23.8 t/s) in the
+  same process. Check which tier a model took via the model inventory
+  (`accel.mode: npu_layer | per_op | cpu`) or `axcl-smi`.
+
+Troubleshooting the card:
+
+| symptom | cause → check |
+|---|---|
+| fan at full speed, always | card is on the 3.6.5-era firmware → reflash with a current image (quiet pac is built in) |
+| no `/dev/axcl_host`, card absent from `axcl-smi` | PCIe not up → `config.txt` must keep `dtparam=pciex1` + `dtoverlay=pciex1-compat-pi5,no-mip` and the boot FAT must contain `overlays/pciex1-compat-pi5.dtbo` (the image vendors it) |
+| `uname -r` differs from `ls /lib/modules/`, no modules load | boot partition and rootfs slot are from different builds → reflash a complete image; never mix boot files across builds |
+| models serve on CPU with the card present | geometry doesn't match an installed engine set (by design) — see [docs/axera.md](docs/axera.md); check `dmesg` for the `axcl` driver and the engine log's `accel:` line |
+
 ## Design invariants
 
 - **Any GGUF, always.** The engine never rejects a model for lack of an
@@ -245,7 +281,7 @@ build.
 
 | component | validated |
 |---|---|
-| engine API/auth/guardrails/queue/templates | 22 host unit tests, green |
+| engine API/auth/guardrails/queue/templates | 32 host unit tests, green |
 | engine end-to-end (boots real binary, provision → login → OpenAI JSON → SSE) | integration test, green |
 | **real tensor backend (`--features llama`)** | **compiles against llama.cpp (WSL, cmake+bindgen); real Qwen2.5-0.5B Q4_K_M served: correct answer, `finish_reason: stop`, 28-chunk SSE stream** |
 | **OS image build (`os/build.sh --variant sd`, WSL2 Ubuntu)** | **`markos-sd.img` produced: FAT32 boot (kernel/dtb/firmware), squashfs A/B slots, data partition, aarch64 engine cross-compiled with llama.cpp+TLS, full appliance overlay (init stages, s6 services, firewall, update/recovery tools) — verified by unpacking the image** |
@@ -334,3 +370,9 @@ accelerator, not the VideoCore GPU) · no multi-Pi clustering (noted as
 future work in the design doc) · no general server dashboard · no
 telemetry, no auto-updates, no runtime dependencies beyond
 user-initiated model downloads.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The reusable third-party components keep
+their own licenses (llama.cpp/ggml, the Axera AXCL runtime and driver,
+Buildroot, the Linux kernel; notes at the bottom of the LICENSE file).
