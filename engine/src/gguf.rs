@@ -523,13 +523,55 @@ impl GgufMeta {
     }
 
     /// Best-effort quantization label: dominant non-embedding tensor type.
+    /// Human quant label. Prefers `general.file_type` (what llama.cpp
+    /// actually quantized the file to — e.g. Q4_K_M), falling back to the
+    /// byte-weighted dominant tensor dtype. The dtype heuristic alone
+    /// mislabels mixed files: a Q4_K_M GGUF keeps token-embedding and norm
+    /// tensors at q5_0/q8_0, which can outweigh the q4_K payload bytes.
     pub fn quant_label(&self) -> String {
+        if let Some(ft) = self.kv.get("general.file_type").and_then(|v| v.as_u64()) {
+            let named = match ft {
+                0 => "F32",
+                1 => "F16",
+                2 => "Q4_0",
+                3 => "Q4_1",
+                7 => "Q8_0",
+                8 => "Q5_0",
+                9 => "Q5_1",
+                10 => "Q2_K",
+                11 => "Q3_K_S",
+                12 => "Q3_K_M",
+                13 => "Q3_K_L",
+                14 => "Q4_K_S",
+                15 => "Q4_K_M",
+                16 => "Q5_K_S",
+                17 => "Q5_K_M",
+                18 => "Q6_K",
+                19 => "IQ2_XXS",
+                20 => "IQ2_XS",
+                21 => "Q2_K_S",
+                22 => "IQ3_XS",
+                23 => "IQ3_XXS",
+                24 => "IQ1_S",
+                25 => "IQ4_NL",
+                26 => "IQ3_S",
+                27 => "IQ3_M",
+                28 => "IQ2_S",
+                29 => "IQ4_XS",
+                30 => "I8",
+                31 => "I16",
+                32 => "I32",
+                33 => "I64",
+                34 => "F64",
+                35 => "IQ1_M",
+                _ => "",
+            };
+            if !named.is_empty() {
+                return named.to_string();
+            }
+        }
         let mut counts: BTreeMap<String, u64> = BTreeMap::new();
         for t in &self.tensors {
-            if t.name.contains("ffn_down") || t.name.ends_with(".output") {
-                // llama.cpp conventionally keeps these at higher precision;
-                // still count them, but below.
-            }
             *counts.entry(t.dtype.name()).or_insert(0) += t.nbytes;
         }
         counts

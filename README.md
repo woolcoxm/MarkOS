@@ -38,7 +38,7 @@ engine is one aarch64 binary. Full rationale: [docs/design.md](docs/design.md#2-
 | `engine/` | markos-engine: custom HTTP/1.1 serving layer, OpenAI-compatible API (SSE), admin control plane, embedded web UI (`engine/web/`), GGUF reader, memory guardrails, model manager (mock backend default; `llama` feature = llama.cpp/ggml) |
 | `installer/` | markos-installer: egui GUI + scriptable CLI, config validation, **custom FAT32 writer** for config injection, raw-disk flasher (`\\.\PhysicalDriveN`, `/dev/sdX`) |
 | `os/` | Buildroot external tree: defconfig, kernel fragment, board overlay (runit services, firewall, watchdog, first-boot provisioner, recovery, `markos-update`), genimage layouts, `build.sh` |
-| `scripts/make_gguf_test.py` | synthetic GGUF generator (ported from the repo's earlier bare-metal kernel work) |
+| `scripts/` | benchmark + e2e suites (`bench_final.py`, `bench.py`, `e2e_test.py`), engine build/deploy (`engine-build.sh`, `deploy-engine.sh`), raw-stack ceiling (`build-llama-bench.sh`), synthetic GGUF generator (`make_gguf_test.py`) |
 | `docs/axera.md` | **Axera AX8850 accelerator support** — the M5Stack LLM-8850 M.2 card: NPU serving ladder, engine sets, driver/runtime packages |
 
 ## Quickstart
@@ -259,17 +259,19 @@ build.
 
 ## Measured performance (on-target, Raspberry Pi 5 16 GB + AX8850)
 
-| model | tier | quant | decode t/s | prefill t/s | quality eval | notes |
-|---|---|---|---|---|---|---|
-| Qwen3-0.6B | **NPU** (matching engine set) | Q8_0 | **16.1** | **135** | coherent reasoning (Qwen3 thinking mode) | 2.6 GB CMM on card |
-| Qwen2.5-0.5B | CPU (non-matching) | Q4_K_M | **23.8** | **94** | 8/8 pass (arithmetic, factual, reasoning) | pure CPU/NEON, 2 decode / 4 prefill threads |
+| model | tier | quant | decode t/s | prefill tok/s | first-request TTFT | warm multi-turn TTFT | quality eval |
+|---|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | CPU (non-matching) | Q4_K_M | **23.8** | **94** | **0.3–0.6 s** | **~0.3 s** | 8/8 (arithmetic, factual, reasoning) |
+| Qwen3-0.6B | **NPU** (matching engine set) | Q8_0 | **16.1** | **135** | **0.3 s** | **~0.3 s** | coherent reasoning (thinking mode) |
 
-Streaming decode measured over SSE; first request after boot answers in
-0.3–0.6 s (models auto-load + warm at startup), and warm multi-turn TTFT is
-~0.3 s (prompt-prefix KV reuse — only the new turn is pre-filled).
+The engine now sits **on top of the raw llama.cpp stack** instead of
+underneath it — a CPU-only `llama-bench` built from the same fork on the
+same box measures tg64 16.2 / 22.6 / 16.6 t/s at 1/2/4 threads and pp512
+84.5 t/s, and the serving layer matches those numbers.
 
-2026-09-17 perf deep dive, root causes fixed (was: NPU 7.4 t/s, CPU
-1.0–1.9 t/s with 13 s TTFT):
+2026-09-17 perf deep dive — the box used to measure **CPU 1.0–1.9 t/s decode
+with a ~13 s time-to-first-token on every request, NPU 7.4–9.7 t/s**. Root
+causes, all fixed:
 
 1. **Fork pin was one commit behind the opt-in registration fix** — the
    appliance built the axcl backend that registers unconditionally whenever
@@ -277,8 +279,7 @@ Streaming decode measured over SSE; first request after boot answers in
    the CPU backend — shared buffer type) routed CPU-tier computation
    through the axcl graph path: single-threaded host fallback for decode
    (2.4 t/s on a 16 t/s-capable stack) and per-request NPU/PCIe probing
-   (13 s TTFT). Pin bumped c8d226b → 1bddded; llama-bench on the same box:
-   tg64 16–23 t/s, pp512 84 t/s — the engine now matches the raw stack.
+   (13 s TTFT). Pin bumped c8d226b → 1bddded.
 2. **Decode/batch thread split** (new `threads_decode` model config,
    default = half of `threads`): the Pi 5 is memory-bandwidth bound at
    decode; 2 threads beat 4 (llama-bench tg64: 22.6 vs 16.6 t/s), while
@@ -287,6 +288,7 @@ Streaming decode measured over SSE; first request after boot answers in
 3. **Prompt-prefix KV reuse** (CPU tier): multi-turn chats pre-fill only
    the new suffix instead of the whole conversation (`llama_memory_seq_rm`
    through the shim; whole-layer NPU still clears — no partial removal).
+   A repeated 454-token prompt: 5.3 s → 0.4 s.
 4. **Context caching + boot warmup**: the inference context is created once
    per model slot; auto-loaded models run a 1-token warmup generation so
    NPU engine loading lands at boot, not on the first request.
@@ -295,14 +297,17 @@ Streaming decode measured over SSE; first request after boot answers in
    re-walked the full 150k-token GGUF header on every request); stop-string
    scan and output copying are O(1)/token instead of O(output²).
 
-Remaining NPU headroom vs the 24–30 t/s PoC is template quality, not host
+Remaining NPU headroom vs the PoC's 24–30 t/s is template quality, not host
 code: the vendor Q8_0 templates run ~1.9 ms/layer vs ~1.17 ms/layer for
-Pulsar2-tuned s4 builds — see [docs/axera.md](docs/axera.md).
+Pulsar2-tuned s4 builds. Full detail — methodology, ceilings, per-fix
+measurements, reproduction steps — in [docs/performance.md](docs/performance.md);
+template headroom in [docs/axera.md](docs/axera.md).
 
-Benchmark suite: `os/output/bench_final.py` (first-request, decode, prefill,
-multi-turn TTFT), `os/output/bench.py` (quality eval). E2E + security
-suite: `os/output/e2e_test.py` (31 tests across 8 categories, green on the
-final build).
+Benchmarks live in the repo now: `scripts/bench_final.py` (authoritative:
+first-request, decode, prefill, multi-turn TTFT), `scripts/bench.py`
+(classic suite + quality eval), `scripts/e2e_test.py` (31 tests across 8
+categories — green on the final build). Raw-stack ceiling cross-check:
+`scripts/build-llama-bench.sh`.
 
 ### Security audit (2026-09-17)
 

@@ -111,3 +111,11 @@ tokens for all models, even with `n_gpu_layers=0` and no env vars set.
 | Qwen2.5-0.5B Q5_0 | CPU fallback | 1.0 | 7/8 evals pass |
 
 Both from the same engine process with card present.
+
+> **Addendum (2026-09-17, later that day):** the 1.0 t/s CPU figure above
+> was the *broken* baseline, not the hardware's — the image's fork pin
+> predated the opt-in registration fix, so the axcl backend was computing
+> the CPU tier single-threaded. After the pin bump + serving-layer work
+> (see [docs/performance.md](performance.md)) the same box measures
+> **23.8 t/s** on this tier. The 7.4 t/s NPU figure rose to 16.1 t/s with
+> the decode-thread split.

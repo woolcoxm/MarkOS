@@ -216,13 +216,14 @@ This is the single source of truth in `engine/src/guard.rs`, shared by both.
 
 ### 8.3 Concurrency
 
-Single-box, CPU-only, single-digit tok/s per stream at useful model sizes: the
+Single-box, one stream per resident model at appliance-class rates (measured:
+~24 t/s CPU decode, ~16 t/s NPU decode — see docs/performance.md): the
 scheduler allows **one active generation per resident model** (prefill chunks
 between decode steps of the other slot), a configurable bounded FIFO queue
 (default depth 4, per-endpoint), and instant `429 Too Many Requests` +
-`Retry-After` when the queue is full. No speculative parallelism beyond threads=4
-for prefill. This is honest about the hardware rather than pretending to be a GPU
-farm.
+`Retry-After` when the queue is full. No speculative parallelism beyond the
+thread split (4 prefill / 2 decode threads). This is honest about the hardware
+rather than pretending to be a GPU farm.
 
 ### 8.4 Multi-model
 
