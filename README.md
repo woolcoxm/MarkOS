@@ -261,11 +261,30 @@ build.
 
 | model | tier | quant | decode t/s | prefill t/s | quality eval | notes |
 |---|---|---|---|---|---|---|
-| Qwen3-0.6B | **NPU** (matching engine set) | Q8_0 | **7.4** | **10** | generates coherent reasoning (Qwen3 thinking mode) | 2.6 GB CMM on card; 7.4× CPU speedup |
-| Qwen2.5-0.5B | CPU (non-matching) | Q5_0 | 1.0 | 2 | 7/8 pass (arithmetic, factual, reasoning) | pure CPU/NEON fallback tier |
+| Qwen3-0.6B | **NPU** (matching engine set) | Q8_0 | **8.7** | **15** | generates coherent reasoning (Qwen3 thinking mode) | 2.6 GB CMM on card |
+| Qwen2.5-0.5B | CPU (non-matching) | Q5_0 | **1.6** | **4** | 7/8 pass (arithmetic, factual, reasoning) | pure CPU/NEON with 4-core threading |
 
 Benchmark suite: `os/output/bench.py` (decode speed 3-run median, prefill
 on ~60-token prompt, 8-prompt quality eval at temperature 0.1).
+E2E + security suite: `os/output/e2e_test.py` (33 tests across 8 categories).
+
+### Security audit (2026-09-17)
+
+| category | result |
+|---|---|
+| Auth: argon2id password hashing | ✓ (no plaintext, no MD5/SHA) |
+| Auth: timing-safe API key comparison | ✓ (`constant_time_eq`) |
+| Auth: session tokens (crypto-random, cookie-scoped) | ✓ |
+| Auth: wrong password → 401, fake session → 401 | ✓ (E2E verified) |
+| TLS: self-signed on UI :4444, auto-generated per boot | ✓ |
+| TLS: plain HTTP to TLS port rejected | ✓ (E2E verified) |
+| XSS: user-supplied model names in error responses | ✓ **fixed** (was reflected, now static) |
+| Input validation: header ≤32 KB, body ≤64 MB | ✓ |
+| Input validation: null bytes, negative values, oversized input | ✓ (E2E verified) |
+| Path traversal: model paths from store, not user input | ✓ |
+| SQL/command injection: no SQL, no shell execution | ✓ (N/A) |
+| Rate limiting: bounded queue, 429 on overflow | ✓ |
+| API port (:8080) authentication | not enforced (by design: LAN-only appliance; admin UI is auth-gated) |
 
 ## Non-goals (v1)
 
