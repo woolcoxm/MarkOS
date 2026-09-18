@@ -196,7 +196,7 @@ impl EngineCtx {
 
     /// resident slots + guardrail estimate for the UI in one shot.
     pub fn inventory(&self, id: &str, n_ctx: Option<u64>) -> Result<serde_json::Value, String> {
-        let cfg = self.model_config(id).ok_or_else(|| format!("unknown model {id}"))?;
+        let cfg = self.model_config(id).ok_or_else(|| "unknown model".to_string())?;
         let path = self.model_path(&cfg);
         let meta = GgufMeta::from_file(&path)?;
         let shape = meta.shape().ok_or("no architecture metadata")?;

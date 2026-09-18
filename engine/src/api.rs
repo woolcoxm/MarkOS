@@ -108,9 +108,11 @@ pub fn resolve_model(ctx: &EngineCtx, want: Option<&str>, profile: Option<&str>)
             .find(|m| m.id == w || m.name == w || m.file == w)
             .cloned()
             .ok_or_else(|| {
+                // never reflect the raw model name back — it's user input
+                // that could contain HTML/script payloads (XSS)
                 (
                     404,
-                    format!("model '{w}' is not configured; see GET /v1/models"),
+                    "model is not configured; see GET /v1/models".to_string(),
                 )
             })?,
         None => store
