@@ -32,7 +32,8 @@ fn emit_utf8(pending: &mut Vec<u8>, out: &mut Vec<u8>, on_token: &mut dyn FnMut(
                 if !s.is_empty() {
                     on_token(s);
                     out.extend_from_slice(s.as_bytes());
-                    *pending = Vec::new();
+                    // keep capacity: this runs once per generated token
+                    pending.clear();
                 }
                 return;
             }
@@ -183,17 +184,20 @@ pub fn load(
 }
 
 impl AxclHandle {
-    fn token_piece(&self, tok: i32) -> String {
+    /// Raw token bytes into the pending buffer. Raw bytes (not a lossy
+    /// String) are load-bearing: byte-fallback tokens split a multi-byte
+    /// character across tokens, and `emit_utf8` exists to reassemble them.
+    /// Also allocation-free per token (stack buffer, no intermediate Vec).
+    fn push_token_piece(&self, tok: i32, pending: &mut Vec<u8>) {
         // c_char is i8 on x86_64 but u8 on aarch64 — keep the buffer typed
         // as c_char so this compiles for both hosts
         let mut buf = [0 as std::ffi::c_char; 256];
         let n = unsafe { sys::markos_llama_token_to_piece(self.model, tok, buf.as_mut_ptr(), 256) };
         if n <= 0 {
-            return String::new();
+            return;
         }
         let len = (n as usize).min(buf.len() - 1);
-        let bytes: Vec<u8> = buf[..len].iter().map(|&b| b as u8).collect();
-        String::from_utf8_lossy(&bytes).into_owned()
+        pending.extend(buf[..len].iter().map(|&b| b as u8));
     }
 }
 
@@ -350,8 +354,7 @@ impl AxclHandle {
                         break;
                     }
                     sys::markos_llama_sampler_accept(smpl, tok);
-                    let piece = self.token_piece(tok);
-                    pending.extend_from_slice(piece.as_bytes());
+                    self.push_token_piece(tok, &mut pending);
                     gen_tokens += 1;
                     let before = out.len();
                     emit_utf8(&mut pending, &mut out, on_token);

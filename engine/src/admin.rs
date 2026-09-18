@@ -560,7 +560,9 @@ fn load_model(ctx: &Arc<EngineCtx>, req: &Request, out: &mut ResponseOut, id: &s
     };
     // Synchronous load (the UI shows a spinner; loads take seconds).
     let ec = ctx.engine_config();
-    let mut loader = |c: &ModelConfig| ctx.load_backend(c).map(|(b, _)| b);
+    let mut loader = |c: &ModelConfig| {
+        ctx.load_backend(c).map(|(b, est)| (b, est.total_bytes))
+    };
     ctx.metrics.queued.fetch_add(1, Ordering::Relaxed);
     let r = ctx.manager.acquire(id, &ec, &mut loader, &cfg);
     ctx.metrics.queued.fetch_sub(1, Ordering::Relaxed);

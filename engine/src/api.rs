@@ -174,8 +174,11 @@ fn run_generation(
     let model_id = resolved.cfg.id.clone();
 
     let cancel = Arc::new(AtomicBool::new(false));
-    let mut loader = |c: &ModelConfig| ctx.load_backend(c).map(|(b, _)| b);
-    let guard = match ctx.manager.acquire(&model_id, &ec, &mut loader, &resolved.cfg) {
+    let mut loader = |c: &ModelConfig| {
+        ctx.load_backend(c)
+            .map(|(b, est)| (b, est.total_bytes))
+    };
+    let mut guard = match ctx.manager.acquire(&model_id, &ec, &mut loader, &resolved.cfg) {
         Ok(g) => g,
         Err(e) => {
             ctx.metrics.queued.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);

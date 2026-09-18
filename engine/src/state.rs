@@ -105,6 +105,10 @@ impl EngineCtx {
         let _ec = self.engine_config();
         let n_ctx = cfg.n_ctx.clamp(1, shape.n_ctx_train);
         let est = guard::estimate_ram(&shape, meta.file_size, n_ctx, cfg.n_batch, cfg.kv_quant);
+        // Record the provisional budget on our Loading slot before building
+        // the backend: a second model loading concurrently must see it, or
+        // both loads could pass the guardrail before either is resident.
+        self.manager.set_loading_budget(&cfg.id, est.total_bytes);
         let others = self.manager.resident_bytes_excluding(&cfg.id);
         let available = sysinfo::usable_ram().saturating_sub(others);
         if est.total_bytes > available {
@@ -164,9 +168,11 @@ impl EngineCtx {
                 .name(format!("autoload-{id}"))
                 .spawn(move || {
                     let ec = this.engine_config();
-                    let mut loader = |c: &ModelConfig| this.load_backend(c).map(|(b, _)| b);
+                    let mut loader = |c: &ModelConfig| {
+                        this.load_backend(c).map(|(b, est)| (b, est.total_bytes))
+                    };
                     match this.manager.acquire(&id, &ec, &mut loader, &cfg) {
-                        Ok(g) => {
+                        Ok(mut g) => {
                             // Warm the tensor path now: the first generate()
                             // pays context creation (KV alloc, graph reserve)
                             // and, on the NPU tier, whole-layer engine
@@ -221,8 +227,7 @@ impl EngineCtx {
                         }
                     }
                 })
-                .ok();
-        }
+                .ok();        }
     }
 
     /// resident slots + guardrail estimate for the UI in one shot.

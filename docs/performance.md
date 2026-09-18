@@ -130,6 +130,52 @@ python scripts/bench.py --host 10.0.0.69
 python scripts/e2e_test.py --host 10.0.0.69
 ```
 
+## Serving-layer pass 2 (2026-09-17, host-verified; on-target numbers pending)
+
+Three engine changes. All are host-tested (32 unit + e2e) and cross-built for
+aarch64; the t/s-class effects need the box to confirm.
+
+1. **The manager mutex is no longer held across generation.**
+   `AcquiredGuard::with_backend` ran the whole generation with the manager's
+   global mutex held: a second resident model could not even enter the queue
+   (its `acquire` blocked on the mutex *before* the deadline check, so 429
+   and the queue-timeout 504 could not fire either), and the metrics
+   refresher, `/readyz` and slot summaries all froze until the generation
+   finished. The slot now reports `generating` while the backend is checked
+   out; lock hold time is two swaps. This is also the precondition for
+   design §8.3's "prefill chunks between decode steps of the other slot":
+   a queued request on model B can now acquire its slot and prefill while A
+   decodes. Concurrency honesty is unchanged — still one generation per
+   resident model, bounded queue + 429 enforced as designed.
+2. **The guardrail counts resident models at their full estimated budget,
+   not just weights.** `resident_bytes_excluding` summed only GGUF file
+   sizes of resident models, so the KV + compute + margin the estimator
+   itself charges a *new* load went uncounted for *resident* ones: ≈0.5 GiB
+   invisible for a 0.5B @ 4k config, ≈1.5 GiB for the 0.6B @ 8k reference,
+   ≈5.5 GiB (34 % of the usable budget) for a 7B @ 8k — an OOM window in
+   the two-resident policy. A slot now stores its estimate total when it
+   becomes Ready, and a provisional one while Loading (closing the
+   concurrent-loads race), and the budget math subtracts it.
+3. **The plain llama backend (CPU-only image) caches its context and reuses
+   prompt prefixes.** It still paid a fresh context (KV alloc + graph
+   reserve) per request and re-prefilled every turn — the exact pathologies
+   removed from the axcl backend earlier. Same fix: context created once per
+   slot; prefix KV reuse via `clear_kv_cache_seq`; on error the cache is
+   dropped so the next request starts clean.
+
+Also fixed on both backends: token pieces were lossy-converted per token
+*before* the UTF-8 assembly buffer saw them, so any multi-byte character
+split across tokens (byte-fallback vocab entries — common for emoji and
+rare CJK) streamed as U+FFFD replacement characters. Pieces now flow raw
+into the assembler, which was built for exactly this.
+
+Expected, not yet measured on the box: warm multi-turn TTFT on the CPU-only
+image drops from full re-prefill to suffix-only (the 5.3 s → 0.4 s class of
+win measured for the axcl path above), and a second resident model becomes
+servable while the first generates. No single-stream decode t/s change is
+claimed — the removed per-token allocation churn (pending-buffer
+free/malloc per token, two allocations per token piece) is sub-µs/token.
+
 ## Remaining headroom (NPU tier, template quality — not engine code)
 
 The engine no longer masks the card. What is left to reach the PoC's
